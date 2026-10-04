@@ -44,6 +44,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(first["trade_key"], "trade-1")
         self.assertEqual(first["notional_microusd"], 100_000_000)
 
+    def test_live_v2_token_id_is_accepted(self) -> None:
+        live_shape = dict(TRADE)
+        live_shape["token_id"] = live_shape.pop("asset_id")
+        self.assertEqual(normalize_trade(live_shape)["asset_id"], "asset-1")
+
     def test_fingerprint_distinguishes_fills_in_same_transaction(self) -> None:
         first = normalize_trade(TRADE)
         changed = dict(TRADE, asset_id="asset-2")

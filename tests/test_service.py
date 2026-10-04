@@ -65,6 +65,7 @@ class FakeAPI:
         self.market_payloads = {"condition-1": market()}
         self.wallet_rows: list[dict] = []
         self.pages: list[Page] = []
+        self.wallet_history_calls = 0
         self.book_payload = {
             "bids": [{"price": "0.24", "size": "1000"}],
             "asks": [
@@ -77,6 +78,7 @@ class FakeAPI:
         return self.market_payloads.get(condition_id)
 
     def iter_wallet_trades(self, user: str, end: int):
+        self.wallet_history_calls += 1
         yield from self.wallet_rows
 
     def trades_page(self, **kwargs):
@@ -148,6 +150,17 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(
             self.db.row("SELECT enrichment_status FROM trades")["enrichment_status"], "complete"
         )
+
+    def test_wallet_history_is_cached_but_filtered_for_each_trade_time(self) -> None:
+        self.api.wallet_rows = [trade("old", timestamp=1_000_000, price="0.5", size="200")]
+        counts = Counts()
+        run_id = self.db.start_run("live", 2_000_100)
+        self.collector.process_trade(trade("first"), "live", run_id, counts)
+        second = trade("second", timestamp=2_000_050, asset="asset-2")
+        self.collector.process_trade(second, "live", run_id, counts)
+        self.assertEqual(self.api.wallet_history_calls, 1)
+        snapshots = self.db.rows("SELECT prior_trade_count FROM wallet_snapshots ORDER BY as_of_ts")
+        self.assertEqual([row["prior_trade_count"] for row in snapshots], [1, 1])
 
     def test_updown_is_blacklisted_before_research_rows(self) -> None:
         raw = trade(

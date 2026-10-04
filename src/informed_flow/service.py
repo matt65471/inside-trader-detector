@@ -77,9 +77,20 @@ def _market_category(market: Mapping[str, Any]) -> str | None:
     direct = first(event, "category", default=first(market, "category"))
     if direct:
         return str(direct).lower()
+    known = {
+        "politics", "elections", "geopolitics", "sports", "crypto", "finance",
+        "economy", "business", "tech", "science", "weather", "culture", "world",
+    }
     tags = first(market, "tags", default=[]) or []
-    if tags and isinstance(tags[0], Mapping):
-        return str(first(tags[0], "slug", "label", default="")).lower() or None
+    for tag in tags:
+        if not isinstance(tag, Mapping):
+            continue
+        slug = str(first(tag, "slug", default="")).lower()
+        label = str(first(tag, "label", default="")).lower()
+        if slug in known:
+            return slug
+        if label in known:
+            return label
     return None
 
 
@@ -211,6 +222,7 @@ class Collector:
         self.db = db
         self.api = api
         self.clock = clock
+        self._wallet_history_cache: dict[str, tuple[int, list[dict[str, Any]], int]] = {}
 
     def _now(self) -> int:
         return int(self.clock())
@@ -428,13 +440,19 @@ class Collector:
         notionals: list[int] = []
         markets: set[str] = set()
         timestamps: list[int] = []
-        malformed = 0
-        for raw in self.api.iter_wallet_trades(trade["proxy_wallet"], int(trade["trade_ts"]) - 1):
-            try:
-                prior = normalize_trade(raw)
-            except (ValueError, TypeError):
-                malformed += 1
-                continue
+        cached = self._wallet_history_cache.get(trade["proxy_wallet"])
+        if cached is None or self._now() - cached[0] >= 900:
+            history: list[dict[str, Any]] = []
+            malformed = 0
+            for raw in self.api.iter_wallet_trades(trade["proxy_wallet"], self._now()):
+                try:
+                    history.append(normalize_trade(raw))
+                except (ValueError, TypeError):
+                    malformed += 1
+            cached = (self._now(), history, malformed)
+            self._wallet_history_cache[trade["proxy_wallet"]] = cached
+        _, history, malformed = cached
+        for prior in history:
             if prior["trade_ts"] >= trade["trade_ts"]:
                 continue
             notionals.append(prior["notional_microusd"])
@@ -718,4 +736,3 @@ class Collector:
                     (row["trade_key"], SCORE_VERSION, score, bucket, canonical_json(components), now),
                 )
         return len(rows)
-

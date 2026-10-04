@@ -78,7 +78,7 @@ def normalize_trade(raw: Mapping[str, Any]) -> dict[str, Any]:
         "transaction_hash": str(first(raw, "transaction_hash", "transactionHash", default="")),
         "proxy_wallet": str(first(raw, "proxy_wallet", "proxyWallet", default="")).lower(),
         "condition_id": str(first(raw, "condition_id", "conditionId", default="")).lower(),
-        "asset_id": str(first(raw, "asset_id", "asset", default="")),
+        "asset_id": str(first(raw, "asset_id", "token_id", "tokenId", "asset", default="")),
         "side": str(first(raw, "side", default="")).upper(),
         "price": decimal_value(price),
         "size": decimal_value(size),
@@ -182,4 +182,3 @@ def median_int(values: Iterable[int]) -> int | None:
     if len(ordered) % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) // 2
-
