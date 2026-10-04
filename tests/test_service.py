@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from informed_flow.api import HistoryTruncated, Page
+from informed_flow.api import APIError, HistoryTruncated, Page
+import json
 from informed_flow.core import FEATURE_VERSION, SCORE_VERSION
 from informed_flow.db import Database
 from informed_flow.service import Collector, Counts, parse_book, score_trade
@@ -260,6 +261,8 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNone(wallet["first_activity_ts"])
         self.assertEqual(wallet["prior_trade_count"], 1)
         self.assertIn("history_truncated", wallet["missing_reason"])
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_history_raw")["n"], 3)
+        self.assertEqual(self.db.row("SELECT status FROM wallet_history_fetches")["status"], "truncated")
         self.assertEqual(requests, [(1, 1_999_999)])
         score = self.db.row("SELECT * FROM scores WHERE score_version=?", (SCORE_VERSION,))
         self.assertNotIn("recent_30d_trades_at_most", score["components_json"])
@@ -283,6 +286,54 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(wallet["prior_trade_count"], 1)
         self.assertIn("history_window_complete", wallet["missing_reason"])
         self.assertIsNone(wallet["wallet_age_seconds"])
+
+    def test_raw_history_survives_api_failure_including_malformed_rows(self) -> None:
+        raw = trade("earlier", timestamp=1_999_000)
+        raw["extra_api_field"] = {"detail": "preserve me"}
+        def history(user, end, *, start):
+            yield raw
+            yield {"unparseable": True}
+            raise APIError("request failed")
+        self.api.iter_wallet_trades = history
+        collector = Collector(self.db, self.api, clock=lambda: 2_000_100)
+        collector.process_trade(trade(), "backfill", self.db.start_run("backfill", 2_000_100), Counts())
+        self.assertEqual(collector.enrich_pending(), (0, 1))
+        fetched = self.db.row("SELECT * FROM wallet_history_fetches")
+        self.assertEqual(fetched["status"], "failed")
+        self.assertEqual(fetched["window_end"], 1_999_999)
+        rows = self.db.rows("SELECT raw_json FROM wallet_history_raw ORDER BY row_number")
+        self.assertEqual([json.loads(r["raw_json"]) for r in rows], [raw, {"unparseable": True}])
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_snapshots")["n"], 0)
+
+    def test_stored_history_can_recompute_features_without_network(self) -> None:
+        self.api.wallet_rows = [trade("earlier", timestamp=1_999_000)]
+        collector = Collector(self.db, self.api, clock=lambda: 2_000_100)
+        collector.process_trade(trade(), "backfill", self.db.start_run("backfill", 2_000_100), Counts())
+        self.assertEqual(collector.enrich_pending(), (1, 0))
+        with self.db.connection:
+            self.db.connection.execute("DELETE FROM scores")
+            self.db.connection.execute("DELETE FROM trade_features")
+            self.db.connection.execute("DELETE FROM wallet_snapshots")
+        def unavailable(*args, **kwargs):
+            raise AssertionError("Stored history should be reused")
+        self.api.iter_wallet_trades = unavailable
+        restarted = Collector(self.db, self.api, clock=lambda: 2_000_200)
+        self.assertEqual(restarted.enrich_pending(), (1, 0))
+        self.assertEqual(self.db.row("SELECT prior_trade_count FROM wallet_snapshots")[0], 1)
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_history_fetches")["n"], 1)
+
+    def test_completed_trade_missing_raw_history_is_refetched(self) -> None:
+        self.api.wallet_rows = [trade("earlier", timestamp=1_999_000)]
+        collector = Collector(self.db, self.api, clock=lambda: 2_000_100)
+        collector.process_trade(trade(), "backfill", self.db.start_run("backfill", 2_000_100), Counts())
+        self.assertEqual(collector.enrich_pending(), (1, 0))
+        with self.db.connection:
+            self.db.connection.execute("DELETE FROM wallet_history_raw")
+            self.db.connection.execute("DELETE FROM wallet_history_fetches")
+        self.assertEqual(collector.enrich_pending(), (1, 0))
+        self.assertEqual(self.api.wallet_history_calls, 2)
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_snapshots")["n"], 1)
+        self.assertIn("raw_history_fetch_id:2", self.db.row("SELECT missing_reason FROM wallet_snapshots")[0])
 
 
 if __name__ == "__main__":

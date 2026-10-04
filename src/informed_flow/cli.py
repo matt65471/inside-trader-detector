@@ -159,6 +159,10 @@ def _report(db: Database, high_limit: int) -> None:
     )
     print(f"  excluded five-minute Up/Down markets: {excluded}")
     print(f"  recorded errors: {errors}")
+    history_rows = db.row("SELECT COUNT(*) n FROM wallet_history_raw")["n"]
+    print(f"  raw wallet-history rows: {history_rows}")
+    for row in db.rows("SELECT status,COUNT(*) n FROM wallet_history_fetches GROUP BY status ORDER BY status"):
+        print(f"  wallet-history fetches {row['status']}: {row['n']}")
     if totals["freshest"]:
         print(f"  freshest ingestion: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(totals['freshest']))}")
 

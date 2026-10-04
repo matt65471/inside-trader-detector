@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -126,6 +126,26 @@ CREATE TABLE IF NOT EXISTS wallet_snapshots (
     missing_reason TEXT,
     computed_at INTEGER NOT NULL,
     UNIQUE(proxy_wallet, as_of_ts, feature_version)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_history_fetches (
+    fetch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proxy_wallet TEXT NOT NULL,
+    window_start INTEGER NOT NULL,
+    window_end INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('fetching','complete','truncated','failed')),
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_history_window
+    ON wallet_history_fetches(proxy_wallet,window_start,window_end,status);
+
+CREATE TABLE IF NOT EXISTS wallet_history_raw (
+    fetch_id INTEGER NOT NULL REFERENCES wallet_history_fetches(fetch_id),
+    row_number INTEGER NOT NULL,
+    raw_json TEXT NOT NULL,
+    PRIMARY KEY(fetch_id,row_number)
 );
 
 CREATE TABLE IF NOT EXISTS trade_features (

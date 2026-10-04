@@ -88,6 +88,23 @@ trades completed under older feature versions. An enrichment marked complete
 means processing succeeded; the wallet data may still be partial. Resolved
 performance is not calculated. Current-window inactivity does not establish that
 a wallet is new, and young-wallet cluster features remain unavailable.
+
+Raw enrichment history is durable in SQLite. `wallet_history_raw` stores each
+returned trade row as JSON, including unknown fields and malformed/out-of-window
+rows, separately from the filtered research `trades` table.
+`wallet_history_fetches` records the wallet, requested window, timestamps, status
+(`fetching`, `complete`, `truncated`, or `failed`), and any error. Rows are committed
+in batches before feature calculation; API failures and clean interruptions retain
+the received rows. An abrupt crash may lose the final uncommitted batch; unfinished
+fetches are retried rather than treated as complete.
+
+Complete/truncated fetches are reused for the exact same wallet/window, including
+after restart, so new feature versions can be computed from stored history. Wallet
+snapshots link to their fetch through `raw_history_fetch_id` in `missing_reason`.
+Running `enrich` also refetches history for previously completed selected trades
+that lack raw storage. Schema updates are automatic and preserve existing trades.
+`report` shows raw history row counts and fetch statuses. Old failed attempts are
+kept for auditing; the command retries them with a new fetch record.
 Trade scans stop after 1,000 pages per invocation and can resume from the saved
 cursor. API retries are printed. Historical books remain unavailable.
 

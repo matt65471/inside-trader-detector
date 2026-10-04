@@ -225,7 +225,6 @@ class Collector:
         self.api = api
         self.clock = clock
         self.enrich_inline = enrich_inline
-        self._wallet_history_cache: dict[tuple[str, int], tuple[int, list[dict[str, Any]], int, bool]] = {}
 
     def _now(self) -> int:
         return int(self.clock())
@@ -438,53 +437,87 @@ class Collector:
                 (trade["trade_key"], trade["asset_id"], now),
             )
 
+    def _wallet_history_fetch(self, trade: Mapping[str, Any], start: int, end: int) -> sqlite3.Row:
+        saved = self.db.row(
+            """SELECT * FROM wallet_history_fetches WHERE proxy_wallet=? AND window_start=?
+               AND window_end=? AND status IN ('complete','truncated') ORDER BY fetch_id DESC LIMIT 1""",
+            (trade["proxy_wallet"], start, end),
+        )
+        if saved:
+            print(f"  reusing stored wallet history fetch {saved['fetch_id']}", flush=True)
+            return saved
+        with self.db.connection:
+            cursor = self.db.connection.execute(
+                """INSERT INTO wallet_history_fetches(proxy_wallet,window_start,window_end,status,started_at)
+                   VALUES (?,?,?,'fetching',?)""", (trade["proxy_wallet"], start, end, self._now()),
+            )
+        fetch_id = int(cursor.lastrowid)
+        pending: list[tuple[int, int, str]] = []
+        def flush_rows() -> None:
+            if pending:
+                with self.db.connection:
+                    self.db.connection.executemany(
+                        "INSERT INTO wallet_history_raw(fetch_id,row_number,raw_json) VALUES (?,?,?)", pending,
+                    )
+                pending.clear()
+        status = "complete"
+        error = None
+        try:
+            for index, raw in enumerate(self.api.iter_wallet_trades(trade["proxy_wallet"], end, start=start)):
+                pending.append((fetch_id, index, canonical_json(raw)))
+                if len(pending) >= 100:
+                    flush_rows()
+        except HistoryTruncated as exc:
+            status, error = "truncated", str(exc)
+            print("  history capped: raw sample retained; lifetime age and totals remain unknown", flush=True)
+        except BaseException as exc:
+            status, error = "failed", str(exc) or type(exc).__name__
+            raise
+        finally:
+            flush_rows()
+            with self.db.connection:
+                self.db.connection.execute(
+                    "UPDATE wallet_history_fetches SET status=?,finished_at=?,error_message=? WHERE fetch_id=?",
+                    (status, self._now(), error, fetch_id),
+                )
+        return self.db.row("SELECT * FROM wallet_history_fetches WHERE fetch_id=?", (fetch_id,))
+
     def _wallet_snapshot(self, trade: Mapping[str, Any]) -> int:
+        cutoff = int(trade["trade_ts"]) - 1
+        window_start = max(1, int(trade["trade_ts"]) - 30 * 86400)
+        # Preserve raw rows before calculating features, including for older snapshots.
+        fetched = self._wallet_history_fetch(trade, window_start, cutoff)
         existing = self.db.row(
-            """SELECT wallet_snapshot_id FROM wallet_snapshots
+            """SELECT wallet_snapshot_id,missing_reason FROM wallet_snapshots
                WHERE proxy_wallet=? AND as_of_ts=? AND feature_version=?""",
             (trade["proxy_wallet"], trade["trade_ts"], FEATURE_VERSION),
         )
-        if existing:
+        if existing and f"raw_history_fetch_id:{fetched['fetch_id']}" in (existing["missing_reason"] or "").split(";"):
             return int(existing["wallet_snapshot_id"])
         notionals: list[int] = []
         markets: set[str] = set()
-        timestamps: list[int] = []
-        cutoff = int(trade["trade_ts"]) - 1
-        window_start = max(1, int(trade["trade_ts"]) - 30 * 86400)
-        cache_key = (trade["proxy_wallet"], cutoff)
-        cached = self._wallet_history_cache.get(cache_key)
-        if cached is None or self._now() - cached[0] >= 900:
-            history: list[dict[str, Any]] = []
-            malformed = 0
-            truncated = False
+        malformed = 0
+        truncated = fetched["status"] == "truncated"
+        rows = self.db.connection.execute(
+            "SELECT raw_json FROM wallet_history_raw WHERE fetch_id=? ORDER BY row_number", (fetched["fetch_id"],),
+        )
+        for raw in rows:
             try:
-                for raw in self.api.iter_wallet_trades(trade["proxy_wallet"], cutoff, start=window_start):
-                    try:
-                        history.append(normalize_trade(raw))
-                    except (ValueError, TypeError):
-                        malformed += 1
-            except HistoryTruncated:
-                truncated = True
-                print("  history capped: scoring observed recent behavior; lifetime age and totals remain unknown", flush=True)
-            # Cache only one snapshot per wallet to bound memory, using an exact cutoff.
-            self._wallet_history_cache = {k: v for k, v in self._wallet_history_cache.items() if k[0] != trade["proxy_wallet"]}
-            if len(self._wallet_history_cache) >= 4:
-                self._wallet_history_cache.pop(next(iter(self._wallet_history_cache)))
-            cached = (self._now(), history, malformed, truncated)
-            self._wallet_history_cache[cache_key] = cached
-        _, history, malformed, truncated = cached
-        for prior in history:
+                prior = normalize_trade(json.loads(raw["raw_json"]))
+            except (ValueError, TypeError):
+                malformed += 1
+                continue
             if not window_start <= prior["trade_ts"] <= cutoff:
                 continue
             notionals.append(prior["notional_microusd"])
             markets.add(prior["condition_id"])
-            timestamps.append(prior["trade_ts"])
         now = self._now()
         completeness = "partial"
         reasons = ["resolved_performance_not_computed", "lifetime_age_and_counts_unknown",
                    f"history_window_start:{window_start}", f"history_window_end:{cutoff}",
                    "history_truncated_at_100_pages" if truncated else
-                   "history_window_incomplete_malformed" if malformed else "history_window_complete"]
+                   "history_window_incomplete_malformed" if malformed else "history_window_complete",
+                   f"raw_history_fetch_id:{fetched['fetch_id']}"]
         if malformed:
             reasons.append(f"malformed_prior_rows:{malformed}")
         with self.db.connection:
@@ -494,7 +527,15 @@ class Collector:
                        prior_trade_count,prior_market_count,mean_notional_microusd,
                        median_notional_microusd,max_notional_microusd,prior_resolved_count,
                        prior_wins,prior_pnl_microusd,completeness,missing_reason,computed_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(proxy_wallet,as_of_ts,feature_version) DO UPDATE SET
+                       first_activity_ts=excluded.first_activity_ts,wallet_age_seconds=excluded.wallet_age_seconds,
+                       prior_trade_count=excluded.prior_trade_count,prior_market_count=excluded.prior_market_count,
+                       mean_notional_microusd=excluded.mean_notional_microusd,
+                       median_notional_microusd=excluded.median_notional_microusd,
+                       max_notional_microusd=excluded.max_notional_microusd,
+                       completeness=excluded.completeness,missing_reason=excluded.missing_reason,
+                       computed_at=excluded.computed_at""",
                 (
                     trade["proxy_wallet"], trade["trade_ts"], FEATURE_VERSION, None, None,
                     len(notionals), len(markets), sum(notionals) // len(notionals) if notionals else None,
@@ -502,7 +543,11 @@ class Collector:
                     None, None, None, completeness, ";".join(reasons), now,
                 ),
             )
-        return int(cursor.lastrowid)
+        saved = self.db.row(
+            "SELECT wallet_snapshot_id FROM wallet_snapshots WHERE proxy_wallet=? AND as_of_ts=? AND feature_version=?",
+            (trade["proxy_wallet"], trade["trade_ts"], FEATURE_VERSION),
+        )
+        return int(saved["wallet_snapshot_id"])
 
     def enrich_trade(
         self,
@@ -757,6 +802,10 @@ class Collector:
                  WHERE t.enrichment_status IN ('pending','failed')
                     OR (t.enrichment_status='complete' AND NOT EXISTS (
                         SELECT 1 FROM trade_features f WHERE f.trade_key=t.trade_key AND f.feature_version=?))
+                    OR (t.enrichment_status='complete' AND NOT EXISTS (
+                        SELECT 1 FROM wallet_history_fetches h WHERE h.proxy_wallet=t.proxy_wallet
+                        AND h.window_start=MAX(1,t.trade_ts-2592000) AND h.window_end=t.trade_ts-1
+                        AND h.status IN ('complete','truncated')))
                  ORDER BY t.trade_ts"""
         params: tuple[Any, ...] = (FEATURE_VERSION,)
         if limit is not None:
