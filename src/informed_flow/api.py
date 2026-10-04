@@ -90,15 +90,18 @@ class PolymarketAPI:
         cursor: str | None = None,
         user: str | None = None,
         limit: int = 500,
+        side: str | None = "BUY",
+        taker_only: bool | None = True,
+        min_cash: int | None = 100,
     ) -> Page:
         payload = self.http.get_json(
             self.DATA_BASE,
             "/v2/trades",
             {
-                "side": "BUY",
-                "taker_only": "true",
-                "filter_type": "CASH",
-                "filter_amount": "100",
+                "side": side,
+                "taker_only": "true" if taker_only else None,
+                "filter_type": "CASH" if min_cash is not None else None,
+                "filter_amount": min_cash,
                 "start": start,
                 "end": end,
                 "user": user,
@@ -111,7 +114,15 @@ class PolymarketAPI:
     def iter_wallet_trades(self, user: str, end: int) -> Iterator[dict[str, Any]]:
         cursor: str | None = None
         while True:
-            page = self.trades_page(start=1, end=end, cursor=cursor, user=user)
+            page = self.trades_page(
+                start=1,
+                end=end,
+                cursor=cursor,
+                user=user,
+                side=None,
+                taker_only=None,
+                min_cash=None,
+            )
             yield from page.rows
             if not page.next_cursor:
                 return
@@ -136,4 +147,3 @@ class PolymarketAPI:
         if not isinstance(payload, Mapping):
             raise APIError("CLOB book response is not an object")
         return dict(payload)
-
