@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -146,6 +146,11 @@ CREATE TABLE IF NOT EXISTS wallet_history_raw (
     row_number INTEGER NOT NULL,
     raw_json TEXT NOT NULL,
     PRIMARY KEY(fetch_id,row_number)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_history_summaries (
+    fetch_id INTEGER PRIMARY KEY REFERENCES wallet_history_fetches(fetch_id),
+    summary_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS trade_features (

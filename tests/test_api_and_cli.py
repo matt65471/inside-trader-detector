@@ -123,6 +123,7 @@ class CLITests(unittest.TestCase):
                 "trades.csv",
                 "order_book_summaries.csv",
                 "scores.csv",
+                "wallet_summaries.csv",
             }
             self.assertEqual({path.name for path in output.iterdir()}, expected)
             with (output / "model_features.csv").open(encoding="utf-8") as handle:

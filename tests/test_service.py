@@ -261,7 +261,9 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNone(wallet["first_activity_ts"])
         self.assertEqual(wallet["prior_trade_count"], 1)
         self.assertIn("history_truncated", wallet["missing_reason"])
-        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_history_raw")["n"], 3)
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_history_raw")["n"], 0)
+        summary = json.loads(self.db.row("SELECT summary_json FROM wallet_history_summaries")[0])
+        self.assertEqual(summary["returned_rows"], 3)
         self.assertEqual(self.db.row("SELECT status FROM wallet_history_fetches")["status"], "truncated")
         self.assertEqual(requests, [(1, 1_999_999)])
         score = self.db.row("SELECT * FROM scores WHERE score_version=?", (SCORE_VERSION,))
@@ -301,8 +303,11 @@ class CollectorTests(unittest.TestCase):
         fetched = self.db.row("SELECT * FROM wallet_history_fetches")
         self.assertEqual(fetched["status"], "failed")
         self.assertEqual(fetched["window_end"], 1_999_999)
-        rows = self.db.rows("SELECT raw_json FROM wallet_history_raw ORDER BY row_number")
-        self.assertEqual([json.loads(r["raw_json"]) for r in rows], [raw, {"unparseable": True}])
+        summary = json.loads(self.db.row("SELECT summary_json FROM wallet_history_summaries")[0])
+        self.assertEqual(summary["returned_rows"], 2)
+        self.assertEqual(summary["malformed_rows"], 1)
+        self.assertEqual(summary["observed_trade_count"], 1)
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_history_raw")[0], 0)
         self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_snapshots")["n"], 0)
 
     def test_stored_history_can_recompute_features_without_network(self) -> None:
@@ -329,11 +334,12 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(collector.enrich_pending(), (1, 0))
         with self.db.connection:
             self.db.connection.execute("DELETE FROM wallet_history_raw")
+            self.db.connection.execute("DELETE FROM wallet_history_summaries")
             self.db.connection.execute("DELETE FROM wallet_history_fetches")
         self.assertEqual(collector.enrich_pending(), (1, 0))
         self.assertEqual(self.api.wallet_history_calls, 2)
         self.assertEqual(self.db.row("SELECT COUNT(*) n FROM wallet_snapshots")["n"], 1)
-        self.assertIn("raw_history_fetch_id:2", self.db.row("SELECT missing_reason FROM wallet_snapshots")[0])
+        self.assertIn("history_fetch_id:2", self.db.row("SELECT missing_reason FROM wallet_snapshots")[0])
 
 
 if __name__ == "__main__":

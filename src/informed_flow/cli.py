@@ -14,6 +14,7 @@ from .db import Database
 from .service import Collector, Counts
 from .api import APIError
 from .core import classify_five_minute_updown, first, parse_timestamp
+from .wallet_summary import compact_wallet_history
 
 DEFAULT_DB = Path("data/informed_flow.sqlite3")
 
@@ -161,6 +162,7 @@ def _report(db: Database, high_limit: int) -> None:
     print(f"  recorded errors: {errors}")
     history_rows = db.row("SELECT COUNT(*) n FROM wallet_history_raw")["n"]
     print(f"  raw wallet-history rows: {history_rows}")
+    print(f"  detailed wallet summaries: {db.row('SELECT COUNT(*) n FROM wallet_history_summaries')['n']}")
     for row in db.rows("SELECT status,COUNT(*) n FROM wallet_history_fetches GROUP BY status ORDER BY status"):
         print(f"  wallet-history fetches {row['status']}: {row['n']}")
     if totals["freshest"]:
@@ -235,6 +237,8 @@ def _export(db: Database, output: Path) -> None:
            FROM order_book_snapshots ORDER BY requested_at""",
     )
     _export_query(db, output, "scores.csv", "SELECT * FROM scores ORDER BY trade_key,score_version")
+    _export_query(db, output, "wallet_summaries.csv",
+                  "SELECT h.*,s.summary_json FROM wallet_history_fetches h JOIN wallet_history_summaries s USING(fetch_id) ORDER BY fetch_id")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -244,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"SQLite path (default: {DEFAULT_DB})")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="Initialize or migrate the SQLite database")
+    subparsers.add_parser("compact-wallet-history", help="Summarize stored enrichment history, delete its raw rows, and reclaim space; stop enrichment first")
 
     backfill = subparsers.add_parser("backfill", help="Backfill historical public trades")
     backfill.add_argument("--days", type=int, default=90)
@@ -281,6 +286,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         db.initialize()
         if args.command == "init":
             print(f"Initialized {args.db}")
+            return 0
+        if args.command == "compact-wallet-history":
+            summarized, deleted = compact_wallet_history(db)
+            print(f"Created {summarized} summaries; removed {deleted} raw enrichment rows. Research trades retained.")
             return 0
         if args.command == "report":
             _report(db, args.high_limit)

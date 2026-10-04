@@ -89,24 +89,24 @@ means processing succeeded; the wallet data may still be partial. Resolved
 performance is not calculated. Current-window inactivity does not establish that
 a wallet is new, and young-wallet cluster features remain unavailable.
 
-Raw enrichment history is durable in SQLite. `wallet_history_raw` stores each
-returned trade row as JSON, including unknown fields and malformed/out-of-window
-rows, separately from the filtered research `trades` table.
-`wallet_history_fetches` records the wallet, requested window, timestamps, status
-(`fetching`, `complete`, `truncated`, or `failed`), and any error. Rows are committed
-in batches before feature calculation; API failures and clean interruptions retain
-the received rows. An abrupt crash may lose the final uncommitted batch; unfinished
-fetches are retried rather than treated as complete.
+Enrichment retains compact detailed summaries rather than raw wallet-history rows.
+The summary includes observed trade and market counts, distinct outcomes, active
+days, buy/sell counts and volume, total volume, size percentiles and standard
+deviation, average trade price, recent seven-day activity, time since the last
+observed trade, and market concentration with the top five markets. It covers
+only the requested 30-day window/sample; lifetime age and totals remain unknown.
+`wallet_history_fetches` retains status and window metadata, while
+`wallet_history_summaries` stores the summary JSON. Summaries are reused for the
+same wallet/window and exported to `wallet_summaries.csv`.
 
-Complete/truncated fetches are reused for the exact same wallet/window, including
-after restart, so new feature versions can be computed from stored history. Wallet
-snapshots link to their fetch through `raw_history_fetch_id` in `missing_reason`.
-Running `enrich` also refetches history for previously completed selected trades
-that lack raw storage. Schema updates are automatic and preserve existing trades.
-`report` shows raw history row counts and fetch statuses. Old failed attempts are
-kept for auditing; the command retries them with a new fetch record.
-Trade scans stop after 1,000 pages per invocation and can resume from the saved
-cursor. API retries are printed. Historical books remain unavailable.
+To replace previously collected raw enrichment history with these summaries and
+reclaim disk space, stop enrichment and run `compact-wallet-history` on the same
+database. It summarizes each stored fetch before deleting only
+`wallet_history_raw` rows and vacuuming SQLite. Research trades, market metadata,
+wallet features, scores, and checkpoints are retained. Raw research trade JSON
+is still stored. Subsequent enrichment does not retain raw wallet-history rows.
+New summary fields can require re-fetching history if they cannot be derived
+from existing summaries. `report` shows both raw row and detailed summary counts.
 
 The watch command overlaps each polling window by one minute. The overlap avoids
 boundary gaps; duplicate rows are ignored. Ctrl+C stops after the active request
