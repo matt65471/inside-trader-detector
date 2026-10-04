@@ -50,9 +50,46 @@ python -m informed_flow report
 python -m informed_flow export --output exports
 ```
 
-Backfills use one-day windows, Data API v2 cursor pagination, and durable
-checkpoints. Re-running a completed or interrupted window is safe: market IDs and
-trade fingerprints are protected by database uniqueness constraints.
+Backfills discover open and closed markets through Gamma keyset pagination, then
+fetch each market's Data API v2 trade history and enforce the requested timestamps
+locally. The global trade feed ignores date bounds and cannot serve a 90-day
+backfill. Coverage is limited to API-listed markets and available history, not a
+guarantee of every historical trade. Discovery scans all listed markets and can
+take a long time. Use `backfill --days 90 --max-markets 20` for a partial smoke test;
+the limit counts discovered markets, including excluded markets and empty markets.
+
+The date window is frozen on first run. Discovery and per-market page checkpoints
+resume interrupted scans; duplicate trades are ignored. A completed scan retains
+its original window. Use a new database path to start a fresh window. Old global
+backfill checkpoints are ignored by the corrected implementation. For a clean
+test, use a new database (e.g. `--db data/test_90d_v2.sqlite3`).
+
+Backfill reuses metadata from discovery. Separate condition-ID metadata lookups
+explicitly search both open and closed markets because Gamma defaults to open
+markets. If processing a trade fails, its page is retained for retry and the
+underlying error is printed before the scan stops.
+
+Collection prints page progress and stores selected trades as pending enrichment
+without downloading wallet histories. Run `enrich --limit 20` separately to try a
+small batch, then `enrich` for the remaining selected trades. Wallet requests use
+the 30 days immediately before the observed trade and print progress. The API
+window is also enforced locally. A 100-page cap produces usable sample features
+marked `history_truncated_at_100_pages`; repeated cursors and API errors still
+fail enrichment. Wallet age and lifetime first activity stay null. The existing
+`prior_trade_count` and `prior_market_count` fields now mean observed counts in
+that recent window, not lifetime counts. Mean, median, and maximum size likewise
+describe the observed window/sample. A truncated or malformed history receives
+no low-activity points. Coverage and window bounds are preserved in wallet
+`missing_reason` and exported as `wallet_coverage_details`.
+
+Feature and score version 2 distinguish these semantics from the old lifetime
+attempt. `enrich` automatically retries pending/failed trades and updates selected
+trades completed under older feature versions. An enrichment marked complete
+means processing succeeded; the wallet data may still be partial. Resolved
+performance is not calculated. Current-window inactivity does not establish that
+a wallet is new, and young-wallet cluster features remain unavailable.
+Trade scans stop after 1,000 pages per invocation and can resume from the saved
+cursor. API retries are printed. Historical books remain unavailable.
 
 The watch command overlaps each polling window by one minute. The overlap avoids
 boundary gaps; duplicate rows are ignored. Ctrl+C stops after the active request

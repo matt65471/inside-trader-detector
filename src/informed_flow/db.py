@@ -274,6 +274,7 @@ SELECT
     ws.mean_notional_microusd, ws.median_notional_microusd,
     ws.max_notional_microusd, ws.prior_resolved_count, ws.prior_wins,
     ws.prior_pnl_microusd, ws.completeness AS wallet_completeness,
+    ws.missing_reason AS wallet_coverage_details,
     lf.size_vs_median_milli, lf.seconds_to_resolution,
     lf.same_asset_buys_1h, lf.same_asset_notional_1h,
     lf.young_wallet_buys_1h, lf.category_prior, lf.missing_fields_json,
@@ -309,6 +310,11 @@ class Database:
     def initialize(self) -> None:
         with self.connection:
             self.connection.executescript(SCHEMA_SQL)
+            # Refresh the export view when upgrading an existing database.
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(v_model_features)")}
+            if "wallet_coverage_details" not in columns:
+                self.connection.execute("DROP VIEW v_model_features")
+                self.connection.executescript(SCHEMA_SQL)
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, int(time.time())),

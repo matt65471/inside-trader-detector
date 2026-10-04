@@ -8,8 +8,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping
 
 MICRO = Decimal("1000000")
-FEATURE_VERSION = 1
-SCORE_VERSION = 1
+FEATURE_VERSION = 2
+SCORE_VERSION = 2
 
 
 def first(mapping: Mapping[str, Any], *names: str, default: Any = None) -> Any:

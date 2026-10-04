@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from .api import APIError, Page, PolymarketAPI
+from .api import APIError, HistoryTruncated, Page, PolymarketAPI
 from .core import (
     FEATURE_VERSION,
     SCORE_VERSION,
@@ -118,11 +118,13 @@ def score_trade(
     elif age is not None and age < 30 * 86400:
         add("wallet_under_30d", 2, age)
 
-    prior = int(wallet.get("prior_trade_count") or 0)
-    if prior <= 5:
-        add("prior_trades_at_most_5", 2, prior)
-    elif prior <= 20:
-        add("prior_trades_at_most_20", 1, prior)
+    prior = wallet.get("prior_trade_count")
+    window_complete = "history_window_complete" in (wallet.get("missing_reason") or "")
+    if prior is not None and window_complete:
+        if prior <= 5:
+            add("recent_30d_trades_at_most_5", 2, prior)
+        elif prior <= 20:
+            add("recent_30d_trades_at_most_20", 1, prior)
 
     notional = int(trade["notional_microusd"])
     if notional >= 5_000_000_000:
@@ -218,11 +220,12 @@ def parse_book(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class Collector:
-    def __init__(self, db: Database, api: PolymarketAPI, *, clock=time.time):
+    def __init__(self, db: Database, api: PolymarketAPI, *, clock=time.time, enrich_inline=False):
         self.db = db
         self.api = api
         self.clock = clock
-        self._wallet_history_cache: dict[str, tuple[int, list[dict[str, Any]], int]] = {}
+        self.enrich_inline = enrich_inline
+        self._wallet_history_cache: dict[tuple[str, int], tuple[int, list[dict[str, Any]], int, bool]] = {}
 
     def _now(self) -> int:
         return int(self.clock())
@@ -337,7 +340,8 @@ class Collector:
             str(trade["trade_key"])
         )
 
-    def process_trade(self, raw: Mapping[str, Any], source_mode: str, run_id: int, counts: Counts) -> None:
+    def process_trade(self, raw: Mapping[str, Any], source_mode: str, run_id: int, counts: Counts,
+                      market_raw: Mapping[str, Any] | None = None) -> None:
         counts.seen += 1
         try:
             trade = normalize_trade(raw)
@@ -351,7 +355,10 @@ class Collector:
             counts.excluded += 1
             return
         try:
-            market = self._cached_or_fetch_market(trade["condition_id"])
+            if market_raw is not None and first(market_raw, "conditionId", "condition_id") == trade["condition_id"]:
+                market = market_raw
+            else:
+                market = self._cached_or_fetch_market(trade["condition_id"])
         except APIError as exc:
             counts.errors += 1
             self.db.upsert_pending("classify_market", trade["condition_id"], str(exc), self._now())
@@ -403,7 +410,9 @@ class Collector:
         self.db.resolve_pending("classify_market", trade["condition_id"])
         if source_mode == "backfill":
             self._historical_book_placeholder(trade)
-        if selected:
+        if source_mode == "live" and trade["notional_microusd"] >= BOOK_NOTIONAL_MICROUSD:
+            self.capture_book(trade["trade_key"], run_id)
+        if selected and self.enrich_inline:
             if self.enrich_trade(trade["trade_key"], market, market_snapshot_id, run_id):
                 counts.enriched += 1
                 score = self.db.row(
@@ -440,28 +449,42 @@ class Collector:
         notionals: list[int] = []
         markets: set[str] = set()
         timestamps: list[int] = []
-        cached = self._wallet_history_cache.get(trade["proxy_wallet"])
+        cutoff = int(trade["trade_ts"]) - 1
+        window_start = max(1, int(trade["trade_ts"]) - 30 * 86400)
+        cache_key = (trade["proxy_wallet"], cutoff)
+        cached = self._wallet_history_cache.get(cache_key)
         if cached is None or self._now() - cached[0] >= 900:
             history: list[dict[str, Any]] = []
             malformed = 0
-            for raw in self.api.iter_wallet_trades(trade["proxy_wallet"], self._now()):
-                try:
-                    history.append(normalize_trade(raw))
-                except (ValueError, TypeError):
-                    malformed += 1
-            cached = (self._now(), history, malformed)
-            self._wallet_history_cache[trade["proxy_wallet"]] = cached
-        _, history, malformed = cached
+            truncated = False
+            try:
+                for raw in self.api.iter_wallet_trades(trade["proxy_wallet"], cutoff, start=window_start):
+                    try:
+                        history.append(normalize_trade(raw))
+                    except (ValueError, TypeError):
+                        malformed += 1
+            except HistoryTruncated:
+                truncated = True
+                print("  history capped: scoring observed recent behavior; lifetime age and totals remain unknown", flush=True)
+            # Cache only one snapshot per wallet to bound memory, using an exact cutoff.
+            self._wallet_history_cache = {k: v for k, v in self._wallet_history_cache.items() if k[0] != trade["proxy_wallet"]}
+            if len(self._wallet_history_cache) >= 4:
+                self._wallet_history_cache.pop(next(iter(self._wallet_history_cache)))
+            cached = (self._now(), history, malformed, truncated)
+            self._wallet_history_cache[cache_key] = cached
+        _, history, malformed, truncated = cached
         for prior in history:
-            if prior["trade_ts"] >= trade["trade_ts"]:
+            if not window_start <= prior["trade_ts"] <= cutoff:
                 continue
             notionals.append(prior["notional_microusd"])
             markets.add(prior["condition_id"])
             timestamps.append(prior["trade_ts"])
-        first_ts = min(timestamps) if timestamps else None
         now = self._now()
         completeness = "partial"
-        reasons = ["resolved_performance_not_computed"]
+        reasons = ["resolved_performance_not_computed", "lifetime_age_and_counts_unknown",
+                   f"history_window_start:{window_start}", f"history_window_end:{cutoff}",
+                   "history_truncated_at_100_pages" if truncated else
+                   "history_window_incomplete_malformed" if malformed else "history_window_complete"]
         if malformed:
             reasons.append(f"malformed_prior_rows:{malformed}")
         with self.db.connection:
@@ -473,8 +496,7 @@ class Collector:
                        prior_wins,prior_pnl_microusd,completeness,missing_reason,computed_at
                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    trade["proxy_wallet"], trade["trade_ts"], FEATURE_VERSION, first_ts,
-                    trade["trade_ts"] - first_ts if first_ts is not None else 0,
+                    trade["proxy_wallet"], trade["trade_ts"], FEATURE_VERSION, None, None,
                     len(notionals), len(markets), sum(notionals) // len(notionals) if notionals else None,
                     median_int(notionals), max(notionals) if notionals else None,
                     None, None, None, completeness, ";".join(reasons), now,
@@ -527,7 +549,11 @@ class Collector:
                 (FEATURE_VERSION, trade["asset_id"], trade["trade_ts"] - 3600, trade["trade_ts"]),
             )
             prior = category_prior(trade["category"], market_raw)
-            missing = ["prior_resolved_count", "prior_wins", "prior_pnl_microusd"]
+            missing = ["prior_resolved_count", "prior_wins", "prior_pnl_microusd",
+                       "wallet_age_seconds", "first_activity_ts", "lifetime_trade_count",
+                       "lifetime_market_count", "young_wallet_buys_1h"]
+            if "history_window_complete" not in (wallet["missing_reason"] or ""):
+                missing.append("complete_30d_history")
             if median is None:
                 missing.append("size_vs_median_milli")
             if trade["end_ts"] is None:
@@ -661,21 +687,41 @@ class Collector:
         source_mode: str,
         checkpoint_name: str,
         initial_cursor: str | None = None,
+        condition: str | None = None,
+        max_pages: int = 1000,
+        market_raw: Mapping[str, Any] | None = None,
     ) -> Counts:
         counts = Counts()
         run_id = self.db.start_run(source_mode, self._now())
         cursor = initial_cursor
         status = "complete"
         latest_ts: int | None = None
+        seen_cursors: set[str] = set()
+        if cursor:
+            seen_cursors.add(cursor)
         try:
             while True:
-                page: Page = self.api.trades_page(start=start, end=end, cursor=cursor)
+                print(f"Fetching {source_mode} page {counts.pages + 1} market={condition or 'global'}", flush=True)
+                kwargs = {"start": start, "end": end, "cursor": cursor}
+                if condition:
+                    kwargs["condition"] = condition
+                page: Page = self.api.trades_page(**kwargs)
                 counts.pages += 1
+                errors_before_page = counts.errors
                 for raw in page.rows:
                     timestamp = first(raw, "timestamp")
                     if timestamp is not None:
+                        if not start <= int(timestamp) <= end:
+                            continue
                         latest_ts = max(latest_ts or int(timestamp), int(timestamp))
-                    self.process_trade(raw, source_mode, run_id, counts)
+                    self.process_trade(raw, source_mode, run_id, counts, market_raw=market_raw)
+                if counts.errors > errors_before_page:
+                    # Retry the same page so failed rows cannot be skipped on resume.
+                    self.db.save_checkpoint(checkpoint_name, cursor=cursor, window_start=start,
+                                            window_end=end, last_trade_ts=latest_ts)
+                    status = "failed"
+                    print(f"  page {counts.pages}: inserted={counts.inserted} errors={counts.errors}; page retained for retry", flush=True)
+                    break
                 cursor = page.next_cursor
                 self.db.save_checkpoint(
                     checkpoint_name,
@@ -684,8 +730,14 @@ class Collector:
                     window_end=end,
                     last_trade_ts=latest_ts,
                 )
+                print(f"  page {counts.pages}: inserted={counts.inserted} seen={counts.seen} errors={counts.errors}", flush=True)
                 if not cursor:
                     break
+                if cursor in seen_cursors:
+                    raise APIError("Trade feed repeated a cursor; scan incomplete")
+                seen_cursors.add(cursor)
+                if counts.pages >= max_pages:
+                    raise APIError("Trade scan reached page limit; rerun to resume", retryable=True)
         except (APIError, KeyboardInterrupt) as exc:
             status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
             if isinstance(exc, APIError):
@@ -701,14 +753,18 @@ class Collector:
         return counts
 
     def enrich_pending(self, limit: int | None = None) -> tuple[int, int]:
-        sql = """SELECT trade_key FROM trades
-                 WHERE enrichment_status IN ('pending','failed') ORDER BY trade_ts"""
-        params: tuple[Any, ...] = ()
+        sql = """SELECT t.trade_key FROM trades t
+                 WHERE t.enrichment_status IN ('pending','failed')
+                    OR (t.enrichment_status='complete' AND NOT EXISTS (
+                        SELECT 1 FROM trade_features f WHERE f.trade_key=t.trade_key AND f.feature_version=?))
+                 ORDER BY t.trade_ts"""
+        params: tuple[Any, ...] = (FEATURE_VERSION,)
         if limit is not None:
             sql += " LIMIT ?"
-            params = (limit,)
+            params += (limit,)
         complete = failed = 0
         for row in self.db.rows(sql, params):
+            print(f"Enriching {row['trade_key']} ({complete + failed + 1})", flush=True)
             if self.enrich_trade(row["trade_key"]):
                 complete += 1
             else:
@@ -717,7 +773,7 @@ class Collector:
 
     def rescore(self) -> int:
         rows = self.db.rows(
-            """SELECT t.*,tf.*,ws.wallet_age_seconds,ws.prior_trade_count
+            """SELECT t.*,tf.*,ws.wallet_age_seconds,ws.prior_trade_count,ws.missing_reason
                FROM trades t JOIN trade_features tf ON tf.trade_key=t.trade_key
                JOIN wallet_snapshots ws ON ws.wallet_snapshot_id=tf.wallet_snapshot_id
                WHERE tf.feature_version=?""",

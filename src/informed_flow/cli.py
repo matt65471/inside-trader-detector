@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import signal
 import sys
 import time
@@ -11,6 +12,8 @@ from typing import Any, Sequence
 from .api import PolymarketAPI
 from .db import Database
 from .service import Collector, Counts
+from .api import APIError
+from .core import classify_five_minute_updown, first, parse_timestamp
 
 DEFAULT_DB = Path("data/informed_flow.sqlite3")
 
@@ -25,52 +28,81 @@ def _print_counts(label: str, counts: Counts) -> None:
         print(f"  HIGH score={score} trade={trade_key} market={title}")
 
 
-def _backfill(collector: Collector, db: Database, days: int) -> int:
-    requested_end = int(time.time())
-    requested_start = requested_end - days * 86400
-    checkpoint_name = f"backfill_{days}d"
-    checkpoint = db.checkpoint(checkpoint_name)
-    if checkpoint and checkpoint["window_start"] is not None:
-        window_start = max(requested_start, int(checkpoint["window_start"]))
-        window_end = int(checkpoint["window_end"] or min(window_start + 86400, requested_end))
-        cursor = checkpoint["cursor"]
-        if cursor is None and window_end < requested_end:
-            window_start = window_end
-            window_end = min(window_start + 86400, requested_end)
-    else:
-        window_start = requested_start
-        window_end = min(window_start + 86400, requested_end)
-        cursor = None
-
-    while window_start < requested_end:
-        label = f"backfill {time.strftime('%Y-%m-%d', time.gmtime(window_start))}"
-        counts = collector.collect_window(
-            start=window_start,
-            end=window_end,
-            source_mode="backfill",
-            checkpoint_name=checkpoint_name,
-            initial_cursor=cursor,
-        )
-        _print_counts(label, counts)
-        checkpoint = db.checkpoint(checkpoint_name)
-        if counts.errors and counts.pages == 0:
-            print("Backfill stopped after an API failure; rerun to resume.", file=sys.stderr)
-            return 1
-        if checkpoint and checkpoint["cursor"]:
-            print("Backfill page remains pending; rerun to resume.", file=sys.stderr)
-            return 1
-        window_start = window_end
-        window_end = min(window_start + 86400, requested_end)
-        cursor = None
-        db.save_checkpoint(
-            checkpoint_name,
-            cursor=None,
-            window_start=window_start,
-            window_end=window_end,
-            last_trade_ts=checkpoint["last_trade_ts"] if checkpoint else None,
-        )
-    print(f"Backfill complete through {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(requested_end))}")
-    return 0
+def _backfill(collector: Collector, db: Database, days: int, max_markets: int | None = None) -> int:
+    # Separate namespace: old global-feed checkpoints cannot describe historical coverage.
+    name = f"market_backfill_{days}d"
+    checkpoint = db.checkpoint(name)
+    end = int(checkpoint["window_end"]) if checkpoint else int(time.time())
+    start = int(checkpoint["window_start"]) if checkpoint else end - days * 86400
+    state = json.loads(checkpoint["cursor"]) if checkpoint and checkpoint["cursor"] else {
+        "closed": True, "after": None, "skip": 0, "done": False,
+    }
+    def save_discovery() -> None:
+        db.save_checkpoint(name, cursor=json.dumps(state), window_start=start,
+                           window_end=end, last_trade_ts=None)
+    save_discovery()
+    print(f"Market backfill: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(start))} to "
+          f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(end))}", flush=True)
+    print("Coverage: Gamma-listed markets with Data API history; unavailable markets are not guaranteed. "
+          "Enrichment is separate. Discovery scans all listed markets, including closed markets.", flush=True)
+    examined = 0
+    seen_discovery: set[tuple[bool, str | None]] = set()
+    try:
+        while not state["done"]:
+            anchor = (state["closed"], state["after"])
+            if anchor in seen_discovery:
+                raise APIError("Gamma repeated a discovery cursor; scan incomplete")
+            seen_discovery.add(anchor)
+            print(f"Discovering {'closed' if state['closed'] else 'open'} markets; processed this run={examined}", flush=True)
+            page = collector.api.markets_page(state["after"], closed=state["closed"])
+            for market in page.rows[state["skip"]:]:
+                if max_markets is not None and examined >= max_markets:
+                    print("Test market limit reached; coverage is partial. Rerun to continue.", flush=True)
+                    return 0
+                condition = first(market, "conditionId", "condition_id")
+                excluded, _ = classify_five_minute_updown(market, market)
+                created = parse_timestamp(market.get("createdAt"))
+                if condition and not excluded and (created is None or created <= end):
+                    market_name = f"{name}:{condition}"
+                    saved = db.checkpoint(market_name)
+                    if not saved or saved["window_start"] != end:
+                        counts = collector.collect_window(
+                            start=start, end=end, source_mode="backfill", condition=str(condition),
+                            checkpoint_name=market_name, initial_cursor=saved["cursor"] if saved else None,
+                            market_raw=market,
+                        )
+                        _print_counts(f"market {condition}", counts)
+                        saved = db.checkpoint(market_name)
+                        if counts.errors or not saved or saved["cursor"]:
+                            error = db.row("SELECT error_message FROM collection_errors ORDER BY error_id DESC LIMIT 1")
+                            if error and counts.errors:
+                                print(f"Market {condition}: {error['error_message']}", file=sys.stderr)
+                            print("Market scan incomplete; rerun to retry/resume.", file=sys.stderr)
+                            return 1
+                        db.save_checkpoint(market_name, cursor=None, window_start=end,
+                                           window_end=end, last_trade_ts=saved["last_trade_ts"])
+                elif not condition:
+                    raise APIError("Gamma listing contains a market without a condition ID; scan incomplete")
+                examined += 1
+                state["skip"] += 1
+                save_discovery()
+            if page.next_cursor:
+                state["after"] = page.next_cursor
+            elif state["closed"]:
+                state["closed"] = False
+                state["after"] = None
+            else:
+                state["done"] = True
+            state["skip"] = 0
+            save_discovery()
+        print("Market scan complete for API-listed coverage. This frozen window is retained; use a new DB for a new window.", flush=True)
+        return 0
+    except APIError as exc:
+        print(f"Backfill stopped: {exc}. Rerun to resume.", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Backfill interrupted; saved trades and completed pages are retained.", flush=True)
+        return 130
 
 
 def _watch(collector: Collector, db: Database, *, once: bool, interval: int) -> int:
@@ -211,6 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     backfill = subparsers.add_parser("backfill", help="Backfill historical public trades")
     backfill.add_argument("--days", type=int, default=90)
+    backfill.add_argument("--max-markets", type=int, help="Limit discovered markets for a partial test run")
 
     watch = subparsers.add_parser("watch", help="Watch new public trades")
     watch.add_argument("--once", action="store_true", help="Poll once and exit")
@@ -234,6 +267,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--days must be positive")
     if getattr(args, "interval", 1) <= 0:
         parser.error("--interval must be positive")
+    if getattr(args, "max_markets", None) is not None and args.max_markets <= 0:
+        parser.error("--max-markets must be positive")
+    if getattr(args, "limit", None) is not None and args.limit <= 0:
+        parser.error("--limit must be positive")
 
     db = Database(args.db)
     try:
@@ -250,7 +287,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         collector = Collector(db, PolymarketAPI())
         if args.command == "backfill":
-            return _backfill(collector, db, args.days)
+            return _backfill(collector, db, args.days, args.max_markets)
         if args.command == "watch":
             return _watch(collector, db, once=args.once, interval=args.interval)
         if args.command == "enrich":

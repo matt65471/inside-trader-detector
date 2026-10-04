@@ -17,6 +17,10 @@ class APIError(RuntimeError):
         self.retryable = retryable
 
 
+class HistoryTruncated(APIError):
+    """The requested window exceeded the page budget; yielded rows are a sample."""
+
+
 @dataclass(frozen=True)
 class Page:
     rows: list[dict[str, Any]]
@@ -57,6 +61,8 @@ class HTTPClient:
                 if attempt >= self.retries:
                     raise last_error from exc
                 delay = 2**attempt
+            delay = min(delay, 60.0)
+            print(f"API retry {attempt + 1}/{self.retries} for {path} in {delay:.1f}s: {last_error}", flush=True)
             time.sleep(delay + random.random() * 0.25)
         raise APIError(str(last_error or "unknown API error"), retryable=True)
 
@@ -93,6 +99,7 @@ class PolymarketAPI:
         side: str | None = "BUY",
         taker_only: bool | None = True,
         min_cash: int | None = 100,
+        condition: str | None = None,
     ) -> Page:
         payload = self.http.get_json(
             self.DATA_BASE,
@@ -107,15 +114,18 @@ class PolymarketAPI:
                 "user": user,
                 "limit": limit,
                 "cursor": cursor,
+                "condition": condition,
             },
         )
         return self._page(payload)
 
-    def iter_wallet_trades(self, user: str, end: int) -> Iterator[dict[str, Any]]:
+    def iter_wallet_trades(self, user: str, end: int, *, start: int = 1) -> Iterator[dict[str, Any]]:
         cursor: str | None = None
-        while True:
+        seen: set[str] = set()
+        for page_number in range(1, 101):
+            print(f"  wallet {user}: history page {page_number}, cutoff={end}", flush=True)
             page = self.trades_page(
-                start=1,
+                start=start,
                 end=end,
                 cursor=cursor,
                 user=user,
@@ -126,18 +136,32 @@ class PolymarketAPI:
             yield from page.rows
             if not page.next_cursor:
                 return
+            if page.next_cursor in seen:
+                raise APIError("Wallet history repeated a cursor; enrichment remains incomplete")
+            seen.add(page.next_cursor)
             cursor = page.next_cursor
+        raise HistoryTruncated("Wallet history exceeded 100 pages; recent-window sample is truncated")
+
+    def markets_page(self, cursor: str | None = None, *, closed: bool = False, limit: int = 100) -> Page:
+        payload = self.http.get_json(self.GAMMA_BASE, "/markets/keyset", {
+            "limit": limit, "after_cursor": cursor, "order": "id", "ascending": "false",
+            "include_tag": "true", "closed": "true" if closed else "false",
+        })
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("markets"), list):
+            raise APIError("Gamma keyset market listing has an unexpected shape")
+        return Page([dict(row) for row in payload["markets"] if isinstance(row, Mapping)],
+                    payload.get("next_cursor"))
 
     def market(self, condition_id: str) -> dict[str, Any] | None:
-        payload = self.http.get_json(
-            self.GAMMA_BASE,
-            "/markets",
-            {"condition_ids": condition_id, "include_tag": "true", "limit": 1},
-        )
-        if isinstance(payload, list):
-            return dict(payload[0]) if payload else None
-        if isinstance(payload, Mapping):
-            rows = payload.get("data")
+        # Gamma defaults to open markets. Explicitly search both cohorts.
+        for closed in ("false", "true"):
+            payload = self.http.get_json(
+                self.GAMMA_BASE,
+                "/markets",
+                {"condition_ids": condition_id, "include_tag": "true", "limit": 1,
+                 "closed": closed},
+            )
+            rows = payload.get("data") if isinstance(payload, Mapping) else payload
             if isinstance(rows, list) and rows:
                 return dict(rows[0])
         return None

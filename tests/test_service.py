@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from informed_flow.api import Page
+from informed_flow.api import HistoryTruncated, Page
+from informed_flow.core import FEATURE_VERSION, SCORE_VERSION
 from informed_flow.db import Database
 from informed_flow.service import Collector, Counts, parse_book, score_trade
 
@@ -77,7 +78,7 @@ class FakeAPI:
     def market(self, condition_id: str):
         return self.market_payloads.get(condition_id)
 
-    def iter_wallet_trades(self, user: str, end: int):
+    def iter_wallet_trades(self, user: str, end: int, *, start: int = 1):
         self.wallet_history_calls += 1
         yield from self.wallet_rows
 
@@ -124,7 +125,7 @@ class CollectorTests(unittest.TestCase):
         self.db = Database(Path(self.tempdir.name) / "collector.sqlite3")
         self.db.initialize()
         self.api = FakeAPI()
-        self.collector = Collector(self.db, self.api, clock=lambda: 2_000_100)
+        self.collector = Collector(self.db, self.api, clock=lambda: 2_000_100, enrich_inline=True)
 
     def tearDown(self) -> None:
         self.db.close()
@@ -158,7 +159,7 @@ class CollectorTests(unittest.TestCase):
         self.collector.process_trade(trade("first"), "live", run_id, counts)
         second = trade("second", timestamp=2_000_050, asset="asset-2")
         self.collector.process_trade(second, "live", run_id, counts)
-        self.assertEqual(self.api.wallet_history_calls, 1)
+        self.assertEqual(self.api.wallet_history_calls, 2)
         snapshots = self.db.rows("SELECT prior_trade_count FROM wallet_snapshots ORDER BY as_of_ts")
         self.assertEqual([row["prior_trade_count"] for row in snapshots], [1, 1])
 
@@ -205,6 +206,83 @@ class CollectorTests(unittest.TestCase):
         checkpoint = self.db.checkpoint("live")
         self.assertIsNone(checkpoint["cursor"])
         self.assertEqual(checkpoint["last_trade_ts"], 2_000_000)
+
+    def test_collection_defers_wallet_history_and_filters_dates(self) -> None:
+        collector = Collector(self.db, self.api, clock=lambda: 2_000_100)
+        self.api.pages = [Page([trade("old", timestamp=1), trade(), trade("future", timestamp=3_000_000)], None)]
+        counts = collector.collect_window(start=1_900_000, end=2_000_001,
+                                          source_mode="backfill", checkpoint_name="test", condition="condition-1")
+        self.assertEqual(counts.inserted, 1)
+        self.assertEqual(self.api.wallet_history_calls, 0)
+        self.assertEqual(self.db.row("SELECT enrichment_status FROM trades")["enrichment_status"], "pending")
+
+    def test_repeated_cursor_stops_and_records_failure(self) -> None:
+        self.api.pages = [Page([], "same"), Page([], "same")]
+        counts = self.collector.collect_window(start=1, end=2_000_001,
+                                              source_mode="backfill", checkpoint_name="repeat")
+        self.assertEqual(counts.errors, 1)
+        self.assertEqual(counts.pages, 2)
+        self.assertEqual(self.db.row("SELECT status FROM collector_runs")["status"], "failed")
+
+    def test_failed_trade_page_is_replayed_on_resume(self) -> None:
+        collector = Collector(self.db, self.api, clock=lambda: 2_000_100)
+        self.api.market_payloads.clear()
+        self.api.pages = [Page([trade()], "next")]
+        counts = collector.collect_window(start=1, end=2_000_001,
+                                          source_mode="backfill", checkpoint_name="retry")
+        self.assertEqual(counts.errors, 1)
+        self.assertIsNone(self.db.checkpoint("retry")["cursor"])
+        self.assertEqual(self.db.row("SELECT status FROM collector_runs")["status"], "failed")
+        self.api.pages = [Page([trade()], None)]
+        counts = collector.collect_window(start=1, end=2_000_001, source_mode="backfill",
+                                          checkpoint_name="retry", market_raw=market())
+        self.assertEqual(counts.inserted, 1)
+        self.assertEqual(counts.errors, 0)
+
+    def test_truncated_recent_history_is_scored_with_unknown_age(self) -> None:
+        requests = []
+        def history(user, end, *, start):
+            requests.append((start, end))
+            yield trade("earlier", timestamp=1_999_000, size="200")
+            yield trade("outside", timestamp=-1)
+            yield trade("future", timestamp=2_000_001)
+            raise HistoryTruncated("page cap")
+        self.api.iter_wallet_trades = history
+        counts = Counts()
+        self.collector.process_trade(trade(), "backfill", self.db.start_run("backfill", 2_000_100), counts)
+        self.assertEqual(counts.enriched, 1)
+        wallet = self.db.row("SELECT * FROM wallet_snapshots WHERE feature_version=?", (FEATURE_VERSION,))
+        self.assertIsNone(wallet["wallet_age_seconds"])
+
+        score_before = self.db.row("SELECT components_json FROM scores WHERE score_version=?", (SCORE_VERSION,))[0]
+        self.collector.rescore()
+        self.assertEqual(self.db.row("SELECT components_json FROM scores WHERE score_version=?", (SCORE_VERSION,))[0], score_before)
+        self.assertIsNone(wallet["first_activity_ts"])
+        self.assertEqual(wallet["prior_trade_count"], 1)
+        self.assertIn("history_truncated", wallet["missing_reason"])
+        self.assertEqual(requests, [(1, 1_999_999)])
+        score = self.db.row("SELECT * FROM scores WHERE score_version=?", (SCORE_VERSION,))
+        self.assertNotIn("recent_30d_trades_at_most", score["components_json"])
+
+    def test_enrichment_uses_30_day_window_and_reprocesses_old_versions(self) -> None:
+        observed = []
+        timestamp = 10_000_000
+        def history(user, end, *, start):
+            observed.append((start, end))
+            yield trade("outside", timestamp=start-1)
+            yield trade("inside", timestamp=start)
+        self.api.iter_wallet_trades = history
+        collector = Collector(self.db, self.api, clock=lambda: timestamp+100)
+        collector.process_trade(trade(timestamp=timestamp), "backfill",
+                                self.db.start_run("backfill", timestamp+100), Counts())
+        with self.db.connection:
+            self.db.connection.execute("UPDATE trades SET enrichment_status='complete'")
+        self.assertEqual(collector.enrich_pending(), (1, 0))
+        self.assertEqual(observed, [(timestamp-30*86400, timestamp-1)])
+        wallet = self.db.row("SELECT * FROM wallet_snapshots")
+        self.assertEqual(wallet["prior_trade_count"], 1)
+        self.assertIn("history_window_complete", wallet["missing_reason"])
+        self.assertIsNone(wallet["wallet_age_seconds"])
 
 
 if __name__ == "__main__":
