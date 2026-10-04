@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "informed-flow"
+version = "0.1.0"
+description = "Read-only Polymarket informed-flow research collector"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+informed-flow = "informed_flow.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
