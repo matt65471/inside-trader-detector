@@ -16,6 +16,8 @@ from .api import APIError
 from .core import classify_five_minute_updown, first, parse_timestamp
 from .wallet_summary import compact_wallet_history
 from .sampled_backfill import SampledBackfill, SampledBackfillConfig, TARGET_CATEGORIES
+from .jobs import JobQueue
+from .pipeline import AutomatedPipeline
 
 DEFAULT_DB = Path("data/informed_flow.sqlite3")
 
@@ -227,6 +229,10 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
             print(f"  last note/error: {selected['last_error']}")
         if selected["embedding_device_log"] and selected["embedding_device_log"] != "[]":
             print(f"  embedding device fallbacks: {selected['embedding_device_log']}")
+        print(
+            f"  resolution_required={bool(selected['resolution_required'])} "
+            f"resolution_status={selected['resolution_status']}"
+        )
         for category in TARGET_CATEGORIES:
             row = db.row(
                 """SELECT
@@ -259,6 +265,87 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
                 f"redundant={row['redundant']} fetched={row['fetched']} failed={row['failed']} "
                 f"zero_trade={row['zero_trade']} trades={row['trades']} "
                 f"events={row['unique_events']} wallets={wallets}"
+            )
+        for row in db.rows(
+            """SELECT j.job_kind,j.status,COUNT(*) n FROM jobs j
+               WHERE j.cohort_name IN (?,?) GROUP BY j.job_kind,j.status
+               ORDER BY j.job_kind,j.status""", (cohort, f"{cohort}:live"),
+        ):
+            print(f"  jobs {row['job_kind']} {row['status']}: {row['n']}")
+        for row in db.rows(
+            """SELECT job_kind,job_key,attempts,last_error FROM jobs
+               WHERE cohort_name IN (?,?) AND status='dead'
+               ORDER BY updated_at DESC LIMIT 20""", (cohort, f"{cohort}:live"),
+        ):
+            print(
+                f"  dead job {row['job_kind']} attempts={row['attempts']} "
+                f"key={row['job_key']}: {row['last_error']}"
+            )
+        resolution = db.row(
+            """SELECT COUNT(*) checked,COALESCE(SUM(terminal),0) terminal,
+                      COALESCE(SUM(was_disputed),0) disputed
+               FROM market_resolutions WHERE condition_id IN (
+                   SELECT condition_id FROM backfill_cohort_markets WHERE cohort_name=?)""",
+            (cohort,),
+        )
+        print(
+            f"  resolutions checked={resolution['checked']} terminal={resolution['terminal']} "
+            f"disputed={resolution['disputed']}"
+        )
+        for row in db.rows(
+            """SELECT mr.status,mr.quality,COUNT(*) n
+               FROM market_resolutions mr JOIN backfill_cohort_markets cm
+                 ON cm.condition_id=mr.condition_id
+               WHERE cm.cohort_name=? GROUP BY mr.status,mr.quality
+               ORDER BY mr.status,mr.quality""", (cohort,),
+        ):
+            print(f"  resolutions {row['status']} quality={row['quality']}: {row['n']}")
+        for row in db.rows(
+            """SELECT COALESCE(eligibility_reason,'none') reason,COUNT(*) n
+               FROM backfill_cohort_markets
+               WHERE cohort_name=? AND eligible=0 GROUP BY eligibility_reason
+               ORDER BY n DESC,reason""", (cohort,),
+        ):
+            print(f"  excluded {row['reason']}: {row['n']}")
+        expected_labels = db.row(
+            """SELECT COUNT(*) n FROM backfill_cohort_markets cm
+               JOIN backfill_cohorts c USING(cohort_name)
+               JOIN trades t ON t.condition_id=cm.condition_id
+                            AND t.trade_ts BETWEEN c.window_start AND c.window_end
+               WHERE cm.cohort_name=? AND cm.selection_status='selected'""",
+            (cohort,),
+        )["n"]
+        for row in db.rows(
+            """SELECT l.horizon_seconds,l.status,COALESCE(l.price_source,'none') source,
+                      COALESCE(l.price_quality,'none') quality,COUNT(*) n,
+                      SUM(l.fee_source IS NULL) unknown_fees,
+                      ROUND(AVG(l.gross_pnl_microusd)/1000000.0,6) mean_gross
+               FROM labels l JOIN trades t ON t.trade_key=l.trade_key
+               JOIN backfill_cohort_markets cm ON cm.condition_id=t.condition_id
+               JOIN backfill_cohorts c ON c.cohort_name=cm.cohort_name
+               WHERE cm.cohort_name=? AND cm.selection_status='selected'
+                 AND t.trade_ts BETWEEN c.window_start AND c.window_end
+               GROUP BY l.horizon_seconds,l.status,COALESCE(l.price_source,'none'),
+                        COALESCE(l.price_quality,'none')
+               ORDER BY l.horizon_seconds,l.status,source,quality""", (cohort,),
+        ):
+            print(
+                f"  labels +{row['horizon_seconds']}s {row['status']} "
+                f"source={row['source']} quality={row['quality']}: {row['n']} "
+                f"mean_gross/share={row['mean_gross']} unknown_fees={row['unknown_fees']}"
+            )
+        for horizon in (900, 3600, 86400):
+            covered = db.row(
+                """SELECT COUNT(*) n FROM labels l JOIN trades t ON t.trade_key=l.trade_key
+                   JOIN backfill_cohort_markets cm ON cm.condition_id=t.condition_id
+                   JOIN backfill_cohorts c ON c.cohort_name=cm.cohort_name
+                   WHERE cm.cohort_name=? AND cm.selection_status='selected'
+                     AND t.trade_ts BETWEEN c.window_start AND c.window_end
+                     AND l.horizon_seconds=?""", (cohort, horizon),
+            )["n"]
+            print(
+                f"  label coverage +{horizon}s: {covered}/{expected_labels} "
+                f"missing={max(0, expected_labels - covered)}"
             )
 
 
@@ -305,6 +392,35 @@ def _export(db: Database, output: Path, cohort: str | None = None) -> None:
             (cohort,),
         )
         _export_query(
+            db, output, "cohort_resolutions.csv",
+            """SELECT mr.* FROM market_resolutions mr
+               JOIN backfill_cohort_markets cm ON cm.condition_id=mr.condition_id
+               WHERE cm.cohort_name=? ORDER BY cm.canonical_category,cm.random_rank""",
+            (cohort,),
+        )
+        _export_query(
+            db, output, "cohort_labels.csv",
+            """SELECT l.*,cm.canonical_category FROM labels l
+               JOIN trades t ON t.trade_key=l.trade_key
+               JOIN backfill_cohort_markets cm ON cm.condition_id=t.condition_id
+               JOIN backfill_cohorts c ON c.cohort_name=cm.cohort_name
+               WHERE cm.cohort_name=? AND cm.selection_status='selected'
+                 AND t.trade_ts BETWEEN c.window_start AND c.window_end
+               ORDER BY cm.canonical_category,t.trade_ts,l.horizon_seconds""",
+            (cohort,),
+        )
+        _export_query(
+            db, output, "cohort_label_fill_scenarios.csv",
+            """SELECT fs.* FROM label_fill_scenarios fs
+               JOIN trades t ON t.trade_key=fs.trade_key
+               JOIN backfill_cohort_markets cm ON cm.condition_id=t.condition_id
+               JOIN backfill_cohorts c ON c.cohort_name=cm.cohort_name
+               WHERE cm.cohort_name=? AND cm.selection_status='selected'
+                 AND t.trade_ts BETWEEN c.window_start AND c.window_end
+               ORDER BY t.trade_ts,fs.horizon_seconds,fs.target_notional_microusd""",
+            (cohort,),
+        )
+        _export_query(
             db, output, "cohort_trades.csv",
             """SELECT t.*,cm.canonical_category,cm.random_rank
                FROM backfill_cohort_markets cm JOIN backfill_cohorts c USING(cohort_name)
@@ -348,6 +464,22 @@ def build_parser() -> argparse.ArgumentParser:
     sampled.add_argument("--similarity-threshold", type=float, default=0.90)
     sampled.add_argument("--embedding-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
 
+    run = subparsers.add_parser(
+        "run", help="Run the automated resolved historical cohort pipeline"
+    )
+    run.add_argument("--cohort", required=True)
+    run.add_argument("--days", type=int, default=90)
+    run.add_argument("--markets-per-category", type=int, default=1000)
+    run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--similarity-threshold", type=float, default=0.90)
+    run.add_argument("--embedding-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
+    run.add_argument("--market-workers", type=int, default=2)
+    run.add_argument("--enrichment-workers", type=int, default=2)
+    run.add_argument("--resolution-workers", type=int, default=2)
+    run.add_argument("--label-workers", type=int, default=2)
+    run.add_argument("--live", action="store_true")
+    run.add_argument("--interval", type=int, default=60)
+
     watch = subparsers.add_parser("watch", help="Watch new public trades")
     watch.add_argument("--once", action="store_true", help="Poll once and exit")
     watch.add_argument("--interval", type=int, default=60, help="Seconds between polls")
@@ -362,6 +494,9 @@ def build_parser() -> argparse.ArgumentParser:
     export = subparsers.add_parser("export", help="Export portable CSV datasets")
     export.add_argument("--output", type=Path, default=Path("exports"))
     export.add_argument("--cohort")
+    retry = subparsers.add_parser("retry-jobs", help="Return dead queue jobs to pending")
+    retry.add_argument("--kind")
+    retry.add_argument("--entity-id")
     return parser
 
 
@@ -380,6 +515,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--markets-per-category must be positive")
     if not 0 < getattr(args, "similarity_threshold", 0.90) <= 1:
         parser.error("--similarity-threshold must be greater than 0 and at most 1")
+    for field in ("market_workers", "enrichment_workers", "resolution_workers", "label_workers"):
+        if getattr(args, field, 1) <= 0:
+            parser.error(f"--{field.replace('_', '-')} must be positive")
 
     db = Database(args.db)
     try:
@@ -405,6 +543,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             except ValueError as exc:
                 print(exc, file=sys.stderr)
                 return 1
+        if args.command == "retry-jobs":
+            count = JobQueue(db).retry_dead(kind=args.kind, entity_id=args.entity_id)
+            print(f"Retried {count} dead jobs")
+            return 0
+
+        if args.command == "run":
+            db.close()
+            return AutomatedPipeline(
+                args.db,
+                SampledBackfillConfig(
+                    cohort=args.cohort,
+                    days=args.days,
+                    markets_per_category=args.markets_per_category,
+                    seed=args.seed,
+                    similarity_threshold=args.similarity_threshold,
+                    embedding_device=args.embedding_device,
+                    resolution_required=True,
+                ),
+                market_workers=args.market_workers,
+                enrichment_workers=args.enrichment_workers,
+                resolution_workers=args.resolution_workers,
+                label_workers=args.label_workers,
+                live=args.live,
+                live_interval=args.interval,
+            ).run()
 
         collector = Collector(db, PolymarketAPI())
         if args.command == "backfill":
@@ -435,7 +598,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"unknown command: {args.command}")
         return 2
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

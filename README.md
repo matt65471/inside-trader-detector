@@ -22,6 +22,7 @@ export PYTHONPATH=src
 python -m informed_flow init
 python -m informed_flow backfill --days 90
 python -m informed_flow sampled-backfill --cohort balanced-90d --days 90
+python -m informed_flow run --cohort balanced-resolved-90d --days 90
 python -m informed_flow watch
 ```
 
@@ -45,12 +46,14 @@ All commands accept `--db PATH` before the subcommand. The default database is
 python -m informed_flow init
 python -m informed_flow backfill --days 90
 python -m informed_flow sampled-backfill --cohort balanced-90d --days 90
+python -m informed_flow run --cohort balanced-resolved-90d --days 90
 python -m informed_flow watch --once
 python -m informed_flow watch --interval 60
 python -m informed_flow enrich
 python -m informed_flow rescore
 python -m informed_flow report
 python -m informed_flow export --output exports
+python -m informed_flow retry-jobs
 ```
 
 For the category-balanced historical cohort, install the optional local semantic
@@ -81,8 +84,59 @@ downloaded on its first use.
 Use `report --cohort balanced-90d` to inspect eligible, selected, redundant,
 fetched, failed, zero-trade, trade, event, and wallet counts by category. Passing
 the same cohort to `export` additionally writes `cohort_markets.csv`,
-`cohort_trades.csv`, and `cohort_similarity_rejections.csv`. Existing trades are
-not deleted and remain visible in the global report and exports.
+`cohort_trades.csv`, `cohort_similarity_rejections.csv`,
+`cohort_resolutions.csv`, `cohort_labels.csv`, and
+`cohort_label_fill_scenarios.csv`. Existing trades are not deleted and remain
+visible in the global report and exports.
+
+## Automated resolved-market pipeline
+
+`run` is the default historical research workflow. It freezes the cohort window,
+discovers closed markets, verifies terminal resolutions before embedding or
+selection, selects the same balanced nonredundant sample, scans its trades,
+enriches the configured subset, and labels every qualifying cohort trade:
+
+```shell
+python -m informed_flow --db data/informed_flow.sqlite3 run \
+  --cohort balanced-resolved-90d --days 90
+```
+
+Existing cohort names retain their original configuration. A cohort created by
+`sampled-backfill` cannot be silently converted into a resolution-required
+cohort; choose a new name. Missing, pending, canceled, ambiguous, and otherwise
+nonterminal resolutions are excluded before semantic selection. Finally settled
+disputed markets remain eligible, with their raw resolution evidence retained.
+
+The workflow uses a durable SQLite queue with unique jobs, renewable leases,
+eight attempts with exponential backoff, crash recovery, and two workers each
+for resolution verification, market scans, wallet enrichment, and labels. New
+trades and their downstream jobs are committed atomically. On restart, missing
+jobs are also reconstructed from cohort, trade, enrichment, and label state.
+The command exits only after required historical jobs are terminal and returns
+nonzero when a required job is dead. Inspect queue and label coverage with
+`report --cohort balanced-resolved-90d`; after correcting a persistent failure,
+use `retry-jobs` to return dead work to the queue.
+
+Historical labels use +15 minute, +1 hour, and +24 hour targets. They take the
+earliest price-history observation at or after the target, never a pre-target
+point, and allow at most five minutes of delay. A public trade print in that
+same interval is the explicitly approximate fallback. Daily token price series
+are cached per cohort for reuse. If the market resolved before a target, that
+horizon is recorded as unavailable. Historical prices are approximate and do
+not claim executable order-book depth. Gross per-share P&L is stored; historical
+fees and net P&L remain unknown unless a time-applicable fee source is later
+verified.
+
+Live polling is opt-in:
+
+```shell
+python -m informed_flow --db data/informed_flow.sqlite3 run \
+  --cohort balanced-resolved-90d --days 90 --live
+```
+
+Live delayed observations additionally retain top-of-book price, spread, depth,
+and average-fill scenarios for $100, $500, and $1,000. The system remains
+read-only and never submits an order.
 
 Backfills discover open and closed markets through Gamma keyset pagination, then
 fetch each market's Data API v2 trade history and enforce the requested timestamps
@@ -120,8 +174,9 @@ Feature and score version 2 distinguish these semantics from the old lifetime
 attempt. `enrich` automatically retries pending/failed trades and updates selected
 trades completed under older feature versions. An enrichment marked complete
 means processing succeeded; the wallet data may still be partial. Resolved
-performance is not calculated. Current-window inactivity does not establish that
-a wallet is new, and young-wallet cluster features remain unavailable.
+performance is calculated by the separate automated labeling jobs, never as a
+wallet-enrichment feature. Current-window inactivity does not establish that a
+wallet is new, and young-wallet cluster features remain unavailable.
 
 Enrichment retains compact detailed summaries rather than raw wallet-history rows.
 The summary includes observed trade and market counts, distinct outcomes, active

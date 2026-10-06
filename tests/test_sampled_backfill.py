@@ -201,6 +201,13 @@ class SampledBackfillTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "different configuration"):
             changed._cohort()
+        resolution_changed = SampledBackfill(
+            self.db, collector,
+            SampledBackfillConfig("frozen", resolution_required=True),
+            clock=lambda: 500, embedder=FakeEmbedder({}),
+        )
+        with self.assertRaisesRegex(ValueError, "resolution_required"):
+            resolution_changed._cohort()
 
     def test_discovery_resumes_after_repeated_cursor(self):
         first_api = SampleAPI([])

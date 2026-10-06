@@ -166,6 +166,32 @@ class PolymarketAPI:
                 return dict(rows[0])
         return None
 
+    def resolutions(self, condition_ids: list[str]) -> list[dict[str, Any]]:
+        if not condition_ids:
+            return []
+        if len(condition_ids) > 20:
+            raise ValueError("Resolution requests accept at most 20 conditions")
+        payload = self.http.get_json(
+            self.DATA_BASE, "/v2/resolutions", {"condition": ",".join(condition_ids)},
+        )
+        rows = payload.get("data") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list):
+            raise APIError("Resolution response has an unexpected shape")
+        return [dict(row) for row in rows if isinstance(row, Mapping)]
+
+    def price_history(
+        self, asset_id: str, start: int, end: int, *, fidelity: int = 1,
+    ) -> list[dict[str, Any]]:
+        payload = self.http.get_json(
+            self.CLOB_BASE,
+            "/prices-history",
+            {"market": asset_id, "startTs": start, "endTs": end, "fidelity": fidelity},
+        )
+        rows = payload.get("history") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list):
+            raise APIError("Price-history response has an unexpected shape")
+        return [dict(row) for row in rows if isinstance(row, Mapping)]
+
     def book(self, asset_id: str) -> dict[str, Any]:
         payload = self.http.get_json(self.CLOB_BASE, "/book", {"token_id": asset_id})
         if not isinstance(payload, Mapping):

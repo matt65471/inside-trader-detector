@@ -5,7 +5,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .api import APIError, HistoryTruncated, Page, PolymarketAPI
 from .core import (
@@ -221,11 +221,19 @@ def parse_book(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class Collector:
-    def __init__(self, db: Database, api: PolymarketAPI, *, clock=time.time, enrich_inline=False):
+    def __init__(
+        self, db: Database, api: PolymarketAPI, *, clock=time.time,
+        enrich_inline=False, capture_books_inline=True,
+        on_trade_stored: Callable[
+            [sqlite3.Connection, Mapping[str, Any], bool], None
+        ] | None = None,
+    ):
         self.db = db
         self.api = api
         self.clock = clock
         self.enrich_inline = enrich_inline
+        self.capture_books_inline = capture_books_inline
+        self.on_trade_stored = on_trade_stored
 
     def _now(self) -> int:
         return int(self.clock())
@@ -403,6 +411,8 @@ class Collector:
                     now, source_mode, canonical_json(raw), "pending" if selected else "not_selected",
                 ),
             )
+            if cursor.rowcount and self.on_trade_stored is not None:
+                self.on_trade_stored(self.db.connection, trade, selected)
         if cursor.rowcount == 0:
             counts.duplicates += 1
             return
@@ -410,7 +420,10 @@ class Collector:
         self.db.resolve_pending("classify_market", trade["condition_id"])
         if source_mode == "backfill":
             self._historical_book_placeholder(trade)
-        if source_mode == "live" and trade["notional_microusd"] >= BOOK_NOTIONAL_MICROUSD:
+        if (
+            source_mode == "live" and self.capture_books_inline
+            and trade["notional_microusd"] >= BOOK_NOTIONAL_MICROUSD
+        ):
             self.capture_book(trade["trade_key"], run_id)
         if selected and self.enrich_inline:
             if self.enrich_trade(trade["trade_key"], market, market_snapshot_id, run_id):
@@ -719,6 +732,7 @@ class Collector:
         condition: str | None = None,
         max_pages: int = 1000,
         market_raw: Mapping[str, Any] | None = None,
+        progress: Callable[[], None] | None = None,
     ) -> Counts:
         counts = Counts()
         run_id = self.db.start_run(source_mode, self._now())
@@ -759,6 +773,8 @@ class Collector:
                     window_end=end,
                     last_trade_ts=latest_ts,
                 )
+                if progress is not None:
+                    progress()
                 print(f"  page {counts.pages}: inserted={counts.inserted} seen={counts.seen} errors={counts.errors}", flush=True)
                 if not cursor:
                     break

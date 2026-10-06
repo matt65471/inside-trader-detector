@@ -39,6 +39,7 @@ class SampledBackfillConfig:
     similarity_threshold: float = 0.90
     embedding_device: str = "auto"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    resolution_required: bool = False
 
 
 class BatchEmbedder(Protocol):
@@ -248,6 +249,7 @@ class SampledBackfill:
                 "embedding_model": self.config.embedding_model,
                 "similarity_threshold_ppm": self.threshold_ppm,
                 "requested_device": self.config.embedding_device,
+                "resolution_required": int(self.config.resolution_required),
             }
             changed = [key for key, value in expected.items() if row[key] != value]
             if changed:
@@ -264,14 +266,15 @@ class SampledBackfill:
             self.db.connection.execute(
                 """INSERT INTO backfill_cohorts(
                        cohort_name,window_start,window_end,days,category_limit,seed,
-                       embedding_model,similarity_threshold_ppm,requested_device,phase,
-                       created_at,updated_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,'discovering',?,?)""",
+                       embedding_model,similarity_threshold_ppm,requested_device,
+                       resolution_required,resolution_status,phase,created_at,updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'discovering',?,?)""",
                 (
                     self.config.cohort, start, end, self.config.days,
                     self.config.markets_per_category, self.config.seed,
                     self.config.embedding_model, self.threshold_ppm,
-                    self.config.embedding_device, now, now,
+                    self.config.embedding_device, int(self.config.resolution_required),
+                    "pending" if self.config.resolution_required else "not_required", now, now,
                 ),
             )
         return self.db.row("SELECT * FROM backfill_cohorts WHERE cohort_name=?", (self.config.cohort,))
@@ -588,6 +591,10 @@ class SampledBackfill:
                 return 0
             self.discover(cohort)
             cohort = self._cohort()
+            if self.config.resolution_required and cohort["resolution_status"] != "complete":
+                raise RuntimeError(
+                    "This cohort requires resolution verification; use the automated run command"
+                )
             if cohort["phase"] == "embedding":
                 self.ensure_embeddings()
             self.select()

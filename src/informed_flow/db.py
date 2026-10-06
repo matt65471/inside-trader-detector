@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -224,7 +224,59 @@ CREATE TABLE IF NOT EXISTS labels (
     outcome_won INTEGER,
     fee_microusd INTEGER,
     pnl_microusd INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    price_source TEXT,
+    gross_pnl_microusd INTEGER,
+    fee_source TEXT,
+    net_pnl_microusd INTEGER,
+    source_json TEXT,
+    best_bid_ppm INTEGER,
+    spread_ppm INTEGER,
+    ask_depth_1c_microshares INTEGER,
+    ask_depth_5c_microshares INTEGER,
     PRIMARY KEY(trade_key, horizon_seconds)
+);
+
+CREATE TABLE IF NOT EXISTS label_fill_scenarios (
+    trade_key TEXT NOT NULL,
+    horizon_seconds INTEGER NOT NULL,
+    target_notional_microusd INTEGER NOT NULL,
+    average_fill_price_ppm INTEGER,
+    shares_microshares INTEGER,
+    fee_microusd INTEGER,
+    gross_pnl_microusd INTEGER,
+    net_pnl_microusd INTEGER,
+    PRIMARY KEY(trade_key,horizon_seconds,target_notional_microusd),
+    FOREIGN KEY(trade_key,horizon_seconds) REFERENCES labels(trade_key,horizon_seconds)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS market_resolutions (
+    condition_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    terminal INTEGER NOT NULL CHECK (terminal IN (0,1)),
+    winning_outcome_index INTEGER,
+    payouts_json TEXT,
+    resolved_at INTEGER,
+    was_disputed INTEGER NOT NULL DEFAULT 0 CHECK (was_disputed IN (0,1)),
+    source TEXT NOT NULL,
+    quality TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS price_history_cache (
+    cohort_name TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    window_start INTEGER NOT NULL,
+    window_end INTEGER NOT NULL,
+    fidelity_minutes INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('complete','failed')),
+    raw_json TEXT,
+    fetched_at INTEGER NOT NULL,
+    error_message TEXT,
+    PRIMARY KEY(cohort_name,asset_id,window_start,window_end,fidelity_minutes)
 );
 
 CREATE TABLE IF NOT EXISTS collector_runs (
@@ -262,6 +314,8 @@ CREATE TABLE IF NOT EXISTS backfill_cohorts (
     requested_device TEXT NOT NULL,
     effective_device TEXT,
     embedding_device_log TEXT,
+    resolution_required INTEGER NOT NULL DEFAULT 0 CHECK (resolution_required IN (0,1)),
+    resolution_status TEXT NOT NULL DEFAULT 'not_required',
     phase TEXT NOT NULL CHECK (
         phase IN ('discovering','embedding','selecting','fetching','complete','failed')
     ),
@@ -315,6 +369,30 @@ CREATE TABLE IF NOT EXISTS semantic_embeddings (
     created_at INTEGER NOT NULL,
     PRIMARY KEY(model_name,text_hash)
 );
+
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_key TEXT NOT NULL UNIQUE,
+    job_kind TEXT NOT NULL,
+    cohort_name TEXT,
+    entity_id TEXT,
+    payload_json TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('pending','leased','succeeded','dead')),
+    available_at INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_runnable
+    ON jobs(status,available_at,priority DESC,job_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_cohort_kind
+    ON jobs(cohort_name,job_kind,status);
 
 CREATE TABLE IF NOT EXISTS pending_work (
     work_kind TEXT NOT NULL,
@@ -401,6 +479,27 @@ class Database:
     def initialize(self) -> None:
         with self.connection:
             self.connection.executescript(SCHEMA_SQL)
+            self._ensure_column(
+                "backfill_cohorts", "resolution_required",
+                "INTEGER NOT NULL DEFAULT 0 CHECK (resolution_required IN (0,1))",
+            )
+            self._ensure_column(
+                "backfill_cohorts", "resolution_status",
+                "TEXT NOT NULL DEFAULT 'not_required'",
+            )
+            for name, declaration in (
+                ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+                ("price_source", "TEXT"),
+                ("gross_pnl_microusd", "INTEGER"),
+                ("fee_source", "TEXT"),
+                ("net_pnl_microusd", "INTEGER"),
+                ("source_json", "TEXT"),
+                ("best_bid_ppm", "INTEGER"),
+                ("spread_ppm", "INTEGER"),
+                ("ask_depth_1c_microshares", "INTEGER"),
+                ("ask_depth_5c_microshares", "INTEGER"),
+            ):
+                self._ensure_column("labels", name, declaration)
             # Refresh the export view when upgrading an existing database.
             columns = {row[1] for row in self.connection.execute("PRAGMA table_info(v_model_features)")}
             if "wallet_coverage_details" not in columns:
@@ -410,6 +509,11 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, int(time.time())),
             )
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {row[1] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -17,7 +17,7 @@ The most important guardrails are:
 - Ask before undertaking a large new build unless the user explicitly says to
   start implementation.
 
-## Current implementation and user decisions (2026-10-04)
+## Current implementation and user decisions (2026-10-06)
 
 The implementation now exists in `src/informed_flow/`. Some implementation-status
 statements in `docs/PROJECT_CONTEXT.md` describe an earlier checkout. Use this
@@ -80,12 +80,27 @@ section for the current status, while retaining that document's research scope.
   rank, one-market-per-event filtering, and cached local title embeddings. Existing
   trades remain intact. CUDA, Apple MPS, and CPU embedding are supported with
   automatic accelerator fallback; the semantic dependency is optional.
-- Phase 2 labels, profitability evaluation, model training, and paper trading are
-  **not implemented**. A `labels` table exists but is not populated by a labeling
-  pipeline. Do not train a model to reproduce the heuristic score.
-- The summary-only and sampled-backfill implementation was verified with 47 local
-  tests. Update the validation record when subsequent code changes introduce new
-  checks.
+- `run --cohort NAME --days 90` automates resolved historical cohorts. It verifies
+  terminal Data API resolutions before embeddings and selection, then concurrently
+  scans markets, enriches the existing selected subset, and labels every qualifying
+  cohort trade at +15 minutes, +1 hour, and +24 hours. Live polling remains opt-in
+  through `--live`.
+- The SQLite queue uses unique job keys, leases, crash recovery, eight attempts,
+  exponential backoff, and dead-letter reporting. Trade insertion atomically adds
+  downstream work, while startup reconciliation repairs missing jobs from
+  authoritative cohort/trade state.
+- Historical labels use the first post-target price-history point within five
+  minutes, with a public trade print as the approximate fallback. They never use a
+  pre-target point. Gross per-share P&L is populated from verified outcome payouts;
+  historical fees and net P&L remain null without a verified time-applicable source.
+  Historical prices never imply order-book depth. Optional live labels retain book
+  and $100/$500/$1,000 fill scenarios.
+- Phase 2 historical labeling and gross-profit calculation are implemented. Model
+  training, profitability claims, and paper trading are **not implemented**. Do not
+  train a model to reproduce the heuristic score.
+- The summary-only, sampled-backfill, queue, resolution, and labeling implementation
+  was verified with 59 local tests. Update the validation record when subsequent
+  code changes introduce new checks.
 
 ## Checkout and database locations
 
@@ -112,11 +127,10 @@ trades during enrichment-history cleanup.
 2. Improve status reporting so users can distinguish API-returned rows, rows
    outside the window, and saved trades, and inspect backfill completion directly
    rather than treating an ingestion count as proof of completion.
-3. Implement Phase 2 when authorized: delayed entry observations at +15 minutes,
-   +1 hour, and +24 hours; final outcome; applicable fees; following-trade profit.
-   Record source and quality for historical price approximations. Do not pretend
-   historical prints provide executable asks or depth. Keep all feature windows
-   anchored before the observed trade and avoid future leakage.
+3. Run and inspect the resolved historical pipeline: resolution exclusions, queue
+   health, missing horizons, price-source quality, unknown fees, and gross P&L.
+   Verify any fee schedule against a source applicable at the historical trade time
+   before calculating net P&L.
 4. Evaluate outcomes/profit by heuristic score and category, comparing with market
    price as the baseline. Account for category coverage, concentration in a few
    wallets/events, and longshot outliers before claiming an edge.
