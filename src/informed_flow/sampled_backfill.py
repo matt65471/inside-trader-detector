@@ -327,7 +327,7 @@ class SampledBackfill:
 
     def _discover_market(
         self, raw: Mapping[str, Any], start: int, end: int, ordinal: int | None = None,
-    ) -> Mapping[str, Any]:
+    ) -> Mapping[str, Any] | None:
         condition = first(raw, "conditionId", "condition_id")
         if not condition or not str(condition).strip():
             self.db.record_error(

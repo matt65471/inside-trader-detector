@@ -296,6 +296,35 @@ class SampledBackfillTests(unittest.TestCase):
             7,
         )
 
+    def test_lifetime_streaming_logs_and_skips_missing_condition_ids(self):
+        valid = sampled_market(
+            "valid-condition", "Will the valid market resolve?", "Elections", "valid-event",
+        )
+        missing = dict(valid)
+        missing.pop("conditionId")
+        missing["id"] = "missing-condition"
+        api = SampleAPI([missing, valid])
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 10_000_000),
+            SampledBackfillConfig(
+                "skip-missing", days=None, markets_per_category=1, admission_rate=1.0,
+            ),
+            clock=lambda: 10_000_000,
+            embedder=FakeEmbedder({normalize_title(valid["question"]): [1.0, 0.0]}),
+        )
+        runner.stream_select()
+        self.assertEqual(
+            self.db.row(
+                "SELECT COUNT(*) n FROM backfill_cohort_markets WHERE selection_status='selected'"
+            )["n"],
+            1,
+        )
+        error = self.db.row(
+            "SELECT * FROM collection_errors WHERE stage='sampled_discovery'"
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("missing_condition_id", error["error_message"])
+
     def test_lifetime_exhaustion_reconsiders_random_rejects_and_semantic_duplicates(self):
         rows = [
             sampled_market("one", "Will Alpha happen?", "Finance", "event-one"),
