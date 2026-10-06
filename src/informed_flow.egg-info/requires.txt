@@ -1,0 +1,3 @@
+
+[semantic]
+sentence-transformers<6,>=5

@@ -12,7 +12,8 @@ hard-excluded from the research tables.
 ## Requirements
 
 - Python 3.10 or newer
-- No third-party runtime dependencies
+- No third-party runtime dependencies for the core collector; sampled semantic
+  selection uses an optional local-model dependency
 
 Run directly from the checkout:
 
@@ -20,6 +21,7 @@ Run directly from the checkout:
 export PYTHONPATH=src
 python -m informed_flow init
 python -m informed_flow backfill --days 90
+python -m informed_flow sampled-backfill --cohort balanced-90d --days 90
 python -m informed_flow watch
 ```
 
@@ -42,6 +44,7 @@ All commands accept `--db PATH` before the subcommand. The default database is
 ```shell
 python -m informed_flow init
 python -m informed_flow backfill --days 90
+python -m informed_flow sampled-backfill --cohort balanced-90d --days 90
 python -m informed_flow watch --once
 python -m informed_flow watch --interval 60
 python -m informed_flow enrich
@@ -49,6 +52,37 @@ python -m informed_flow rescore
 python -m informed_flow report
 python -m informed_flow export --output exports
 ```
+
+For the category-balanced historical cohort, install the optional local semantic
+model support first:
+
+```shell
+python -m pip install -e ".[semantic]"
+python -m informed_flow sampled-backfill --cohort balanced-90d --days 90 \
+  --markets-per-category 1000 --seed 0 --similarity-threshold 0.90 \
+  --embedding-device auto
+```
+
+`sampled-backfill` first discovers closed markets whose known lifetime overlaps
+the frozen window. It maps elections to politics, economy/business to finance,
+and world to geopolitics, then selects up to 1,000 nonredundant markets in each
+of sports, crypto, weather, culture, finance, geopolitics, and politics. Markets
+from the same event and titles with embedding cosine similarity of at least 0.90
+are treated as redundant. The random ordering, semantic decisions, and chosen
+markets are durable and reproducible for a cohort. Markets with no qualifying
+trades remain part of the sample.
+
+Embedding device `auto` tries NVIDIA CUDA, Apple Metal (`mps`, including M-series
+Macs), and CPU in that order. Accelerator failures fall back to the next device;
+an explicit `cuda`, `mps`, or `cpu` selection is strict. Title vectors are cached
+in SQLite, so a resumed run does not need to recompute them. The local model is
+downloaded on its first use.
+
+Use `report --cohort balanced-90d` to inspect eligible, selected, redundant,
+fetched, failed, zero-trade, trade, event, and wallet counts by category. Passing
+the same cohort to `export` additionally writes `cohort_markets.csv`,
+`cohort_trades.csv`, and `cohort_similarity_rejections.csv`. Existing trades are
+not deleted and remain visible in the global report and exports.
 
 Backfills discover open and closed markets through Gamma keyset pagination, then
 fetch each market's Data API v2 trade history and enforce the requested timestamps
@@ -138,7 +172,7 @@ trade. Future rows are also rejected locally. Phase 1 intentionally leaves
 resolved-performance fields null when they cannot be reconstructed without
 future leakage.
 
-The version 1 score adds points for a young wallet, little prior activity, large
+The version 2 heuristic score adds points for a young wallet, little prior activity, large
 or anomalous size, a cheap outcome, near resolution, a higher-prior category,
 and clusters of young wallets. Every component is retained as JSON. The score is
 a research hypothesis, not a trading recommendation.
@@ -161,4 +195,3 @@ coverage, exclusions, errors, categories, and recent high scores.
 CSV exports are UTF-8 and portable to the later Windows training environment.
 Docker/service packaging is intentionally deferred; the SQLite schema and CLI
 are designed to remain unchanged when that wrapper is added.
-

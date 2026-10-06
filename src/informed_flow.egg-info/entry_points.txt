@@ -1,0 +1,2 @@
+[console_scripts]
+informed-flow = informed_flow.cli:main

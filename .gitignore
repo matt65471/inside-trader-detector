@@ -7,4 +7,4 @@ __pycache__/
 .venv/
 data/
 exports/
-
+YOUR_DATABASE.sqlite3

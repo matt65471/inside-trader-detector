@@ -75,11 +75,17 @@ section for the current status, while retaining that document's research scope.
 - Historical order books are not recoverable from these trades and are marked
   `historical_unavailable`. Live collection attempts book snapshots for trades
   worth at least $1,000. Completed-trade price is not a follower's executable ask.
+- `sampled-backfill` builds a separate, durable cohort from closed markets. It
+  selects up to 1,000 nonredundant markets per canonical category using a seeded
+  rank, one-market-per-event filtering, and cached local title embeddings. Existing
+  trades remain intact. CUDA, Apple MPS, and CPU embedding are supported with
+  automatic accelerator fallback; the semantic dependency is optional.
 - Phase 2 labels, profitability evaluation, model training, and paper trading are
   **not implemented**. A `labels` table exists but is not populated by a labeling
   pipeline. Do not train a model to reproduce the heuristic score.
-- Summary-only implementation was verified with 36 local tests. Update the
-  validation record when subsequent code changes introduce new checks.
+- The summary-only and sampled-backfill implementation was verified with 47 local
+  tests. Update the validation record when subsequent code changes introduce new
+  checks.
 
 ## Checkout and database locations
 
@@ -121,4 +127,3 @@ trades during enrichment-history cleanup.
 
 Do not start these larger new phases without user authorization. Keep execution,
 wallet linking, and reinforcement learning outside the current scope.
-

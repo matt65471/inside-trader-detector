@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -250,6 +250,72 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backfill_cohorts (
+    cohort_name TEXT PRIMARY KEY,
+    window_start INTEGER NOT NULL,
+    window_end INTEGER NOT NULL,
+    days INTEGER NOT NULL,
+    category_limit INTEGER NOT NULL,
+    seed INTEGER NOT NULL,
+    embedding_model TEXT NOT NULL,
+    similarity_threshold_ppm INTEGER NOT NULL,
+    requested_device TEXT NOT NULL,
+    effective_device TEXT,
+    embedding_device_log TEXT,
+    phase TEXT NOT NULL CHECK (
+        phase IN ('discovering','embedding','selecting','fetching','complete','failed')
+    ),
+    discovery_cursor TEXT,
+    discovery_complete INTEGER NOT NULL DEFAULT 0 CHECK (discovery_complete IN (0,1)),
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS backfill_cohort_markets (
+    cohort_name TEXT NOT NULL REFERENCES backfill_cohorts(cohort_name) ON DELETE CASCADE,
+    condition_id TEXT NOT NULL,
+    event_id TEXT,
+    event_slug TEXT,
+    title TEXT NOT NULL,
+    raw_category TEXT,
+    canonical_category TEXT,
+    created_ts INTEGER,
+    end_ts INTEGER,
+    raw_json TEXT NOT NULL,
+    eligible INTEGER NOT NULL CHECK (eligible IN (0,1)),
+    eligibility_reason TEXT,
+    random_rank TEXT,
+    embedding_text_hash TEXT,
+    selection_status TEXT NOT NULL CHECK (
+        selection_status IN ('candidate','selected','redundant','not_selected','not_target','ineligible','excluded')
+    ),
+    selection_reason TEXT,
+    duplicate_of_condition_id TEXT,
+    similarity_ppm INTEGER,
+    fetch_status TEXT NOT NULL CHECK (
+        fetch_status IN ('not_selected','pending','complete','failed')
+    ),
+    qualifying_trade_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    discovered_at INTEGER NOT NULL,
+    PRIMARY KEY(cohort_name, condition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cohort_markets_selection
+    ON backfill_cohort_markets(cohort_name,canonical_category,selection_status,random_rank);
+CREATE INDEX IF NOT EXISTS idx_cohort_markets_fetch
+    ON backfill_cohort_markets(cohort_name,fetch_status);
+
+CREATE TABLE IF NOT EXISTS semantic_embeddings (
+    model_name TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    vector_blob BLOB NOT NULL,
+    generation_device TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(model_name,text_hash)
+);
+
 CREATE TABLE IF NOT EXISTS pending_work (
     work_kind TEXT NOT NULL,
     entity_id TEXT NOT NULL,
@@ -468,4 +534,3 @@ class Database:
 
     def dump_json(self, value: Any) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-

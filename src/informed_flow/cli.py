@@ -15,6 +15,7 @@ from .service import Collector, Counts
 from .api import APIError
 from .core import classify_five_minute_updown, first, parse_timestamp
 from .wallet_summary import compact_wallet_history
+from .sampled_backfill import SampledBackfill, SampledBackfillConfig, TARGET_CATEGORIES
 
 DEFAULT_DB = Path("data/informed_flow.sqlite3")
 
@@ -139,7 +140,7 @@ def _watch(collector: Collector, db: Database, *, once: bool, interval: int) -> 
         signal.signal(signal.SIGINT, previous)
 
 
-def _report(db: Database, high_limit: int) -> None:
+def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
     totals = db.row(
         """SELECT COUNT(*) AS trades,
                   COALESCE(SUM(source_mode='live'),0) AS live,
@@ -208,9 +209,63 @@ def _report(db: Database, high_limit: int) -> None:
                 f"{row['title']} [{row['trade_key']}]"
             )
 
+    if cohort:
+        selected = db.row("SELECT * FROM backfill_cohorts WHERE cohort_name=?", (cohort,))
+        if not selected:
+            raise ValueError(f"Unknown cohort: {cohort}")
+        print(f"Sampled cohort {cohort}")
+        print(
+            f"  phase={selected['phase']} window="
+            f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_start']))} to "
+            f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_end']))}"
+        )
+        print(
+            f"  target/category={selected['category_limit']} seed={selected['seed']} "
+            f"device={selected['effective_device'] or selected['requested_device']}"
+        )
+        if selected["last_error"]:
+            print(f"  last note/error: {selected['last_error']}")
+        if selected["embedding_device_log"] and selected["embedding_device_log"] != "[]":
+            print(f"  embedding device fallbacks: {selected['embedding_device_log']}")
+        for category in TARGET_CATEGORIES:
+            row = db.row(
+                """SELECT
+                       COALESCE(SUM(eligible),0) eligible,
+                       COALESCE(SUM(selection_status='selected'),0) selected,
+                       COALESCE(SUM(selection_status='redundant'),0) redundant,
+                       COALESCE(SUM(selection_status='selected' AND fetch_status='complete'),0) fetched,
+                       COALESCE(SUM(selection_status='selected' AND fetch_status='failed'),0) failed,
+                       COALESCE(SUM(selection_status='selected' AND fetch_status='complete'
+                                    AND qualifying_trade_count=0),0) zero_trade,
+                       COALESCE(SUM(CASE WHEN selection_status='selected'
+                                        THEN qualifying_trade_count ELSE 0 END),0) trades,
+                       COUNT(DISTINCT CASE WHEN selection_status='selected'
+                             THEN COALESCE(event_id,event_slug) END) unique_events
+                   FROM backfill_cohort_markets
+                   WHERE cohort_name=? AND canonical_category=?""",
+                (cohort, category),
+            )
+            wallets = db.row(
+                """SELECT COUNT(DISTINCT t.proxy_wallet) n
+                   FROM backfill_cohort_markets cm JOIN backfill_cohorts c USING(cohort_name)
+                   JOIN trades t ON t.condition_id=cm.condition_id
+                                  AND t.trade_ts BETWEEN c.window_start AND c.window_end
+                   WHERE cm.cohort_name=? AND cm.canonical_category=?
+                     AND cm.selection_status='selected'""",
+                (cohort, category),
+            )["n"]
+            print(
+                f"  {category}: eligible={row['eligible']} selected={row['selected']} "
+                f"redundant={row['redundant']} fetched={row['fetched']} failed={row['failed']} "
+                f"zero_trade={row['zero_trade']} trades={row['trades']} "
+                f"events={row['unique_events']} wallets={wallets}"
+            )
 
-def _export_query(db: Database, output: Path, filename: str, query: str) -> int:
-    cursor = db.connection.execute(query)
+
+def _export_query(
+    db: Database, output: Path, filename: str, query: str, params: tuple[Any, ...] = (),
+) -> int:
+    cursor = db.connection.execute(query, params)
     columns = [description[0] for description in cursor.description]
     rows = cursor.fetchall()
     path = output / filename
@@ -222,7 +277,7 @@ def _export_query(db: Database, output: Path, filename: str, query: str) -> int:
     return len(rows)
 
 
-def _export(db: Database, output: Path) -> None:
+def _export(db: Database, output: Path, cohort: str | None = None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     _export_query(db, output, "model_features.csv", "SELECT * FROM v_model_features ORDER BY trade_ts")
     _export_query(db, output, "trades.csv", "SELECT * FROM trades ORDER BY trade_ts")
@@ -239,6 +294,35 @@ def _export(db: Database, output: Path) -> None:
     _export_query(db, output, "scores.csv", "SELECT * FROM scores ORDER BY trade_key,score_version")
     _export_query(db, output, "wallet_summaries.csv",
                   "SELECT h.*,s.summary_json FROM wallet_history_fetches h JOIN wallet_history_summaries s USING(fetch_id) ORDER BY fetch_id")
+    if cohort:
+        if not db.row("SELECT 1 FROM backfill_cohorts WHERE cohort_name=?", (cohort,)):
+            raise ValueError(f"Unknown cohort: {cohort}")
+        _export_query(
+            db, output, "cohort_markets.csv",
+            """SELECT * FROM backfill_cohort_markets
+               WHERE cohort_name=? AND selection_status='selected'
+               ORDER BY canonical_category,random_rank""",
+            (cohort,),
+        )
+        _export_query(
+            db, output, "cohort_trades.csv",
+            """SELECT t.*,cm.canonical_category,cm.random_rank
+               FROM backfill_cohort_markets cm JOIN backfill_cohorts c USING(cohort_name)
+               JOIN trades t ON t.condition_id=cm.condition_id
+                              AND t.trade_ts BETWEEN c.window_start AND c.window_end
+               WHERE cm.cohort_name=? AND cm.selection_status='selected'
+               ORDER BY cm.canonical_category,cm.random_rank,t.trade_ts""",
+            (cohort,),
+        )
+        _export_query(
+            db, output, "cohort_similarity_rejections.csv",
+            """SELECT cohort_name,condition_id,title,canonical_category,random_rank,
+                      selection_reason,duplicate_of_condition_id,similarity_ppm
+               FROM backfill_cohort_markets
+               WHERE cohort_name=? AND selection_status='redundant'
+               ORDER BY canonical_category,random_rank""",
+            (cohort,),
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -254,6 +338,16 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--days", type=int, default=90)
     backfill.add_argument("--max-markets", type=int, help="Limit discovered markets for a partial test run")
 
+    sampled = subparsers.add_parser(
+        "sampled-backfill", help="Backfill a balanced, semantically deduplicated closed-market cohort"
+    )
+    sampled.add_argument("--cohort", required=True)
+    sampled.add_argument("--days", type=int, default=90)
+    sampled.add_argument("--markets-per-category", type=int, default=1000)
+    sampled.add_argument("--seed", type=int, default=0)
+    sampled.add_argument("--similarity-threshold", type=float, default=0.90)
+    sampled.add_argument("--embedding-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
+
     watch = subparsers.add_parser("watch", help="Watch new public trades")
     watch.add_argument("--once", action="store_true", help="Poll once and exit")
     watch.add_argument("--interval", type=int, default=60, help="Seconds between polls")
@@ -264,8 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("rescore", help="Recompute versioned heuristic scores")
     report = subparsers.add_parser("report", help="Print dataset and score summaries")
     report.add_argument("--high-limit", type=int, default=10)
+    report.add_argument("--cohort")
     export = subparsers.add_parser("export", help="Export portable CSV datasets")
     export.add_argument("--output", type=Path, default=Path("exports"))
+    export.add_argument("--cohort")
     return parser
 
 
@@ -280,6 +376,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--max-markets must be positive")
     if getattr(args, "limit", None) is not None and args.limit <= 0:
         parser.error("--limit must be positive")
+    if getattr(args, "markets_per_category", 1) <= 0:
+        parser.error("--markets-per-category must be positive")
+    if not 0 < getattr(args, "similarity_threshold", 0.90) <= 1:
+        parser.error("--similarity-threshold must be greater than 0 and at most 1")
 
     db = Database(args.db)
     try:
@@ -292,15 +392,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Created {summarized} summaries; removed {deleted} raw enrichment rows. Research trades retained.")
             return 0
         if args.command == "report":
-            _report(db, args.high_limit)
-            return 0
+            try:
+                _report(db, args.high_limit, args.cohort)
+                return 0
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                return 1
         if args.command == "export":
-            _export(db, args.output)
-            return 0
+            try:
+                _export(db, args.output, args.cohort)
+                return 0
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                return 1
 
         collector = Collector(db, PolymarketAPI())
         if args.command == "backfill":
             return _backfill(collector, db, args.days, args.max_markets)
+        if args.command == "sampled-backfill":
+            return SampledBackfill(
+                db,
+                collector,
+                SampledBackfillConfig(
+                    cohort=args.cohort,
+                    days=args.days,
+                    markets_per_category=args.markets_per_category,
+                    seed=args.seed,
+                    similarity_threshold=args.similarity_threshold,
+                    embedding_device=args.embedding_device,
+                ),
+            ).run()
         if args.command == "watch":
             return _watch(collector, db, once=args.once, interval=args.interval)
         if args.command == "enrich":
@@ -319,4 +440,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

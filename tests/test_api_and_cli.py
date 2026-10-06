@@ -156,6 +156,9 @@ class CLITests(unittest.TestCase):
                     "checkpoints",
                     "pending_work",
                     "collection_errors",
+                    "backfill_cohorts",
+                    "backfill_cohort_markets",
+                    "semantic_embeddings",
                 }.issubset(names)
             )
             db.close()

@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: informed-flow
+Version: 0.1.0
+Summary: Read-only Polymarket informed-flow research collector
+Requires-Python: >=3.10
+Provides-Extra: semantic
+Requires-Dist: sentence-transformers<6,>=5; extra == "semantic"

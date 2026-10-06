@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import csv
+import tempfile
+import unittest
+from pathlib import Path
+
+from informed_flow.api import Page
+from informed_flow.cli import _export, _report
+from informed_flow.db import Database
+from informed_flow.sampled_backfill import (
+    LocalSemanticEmbedder,
+    SampledBackfill,
+    SampledBackfillConfig,
+    normalize_title,
+)
+from informed_flow.service import Collector, Counts
+from tests.test_service import FakeAPI, market, trade
+
+
+def sampled_market(
+    condition: str,
+    title: str,
+    category: str,
+    event_id: str,
+    *,
+    event_slug: str | None = None,
+) -> dict:
+    row = market(condition)
+    row.update({
+        "id": f"market-{condition}",
+        "conditionId": condition,
+        "question": title,
+        "slug": condition,
+        "closed": True,
+        "createdAt": "1970-01-20T00:00:00Z",
+        "endDate": "1970-01-30T00:00:00Z",
+        "events": [{
+            "id": event_id,
+            "slug": event_slug or event_id,
+            "category": category,
+        }],
+    })
+    return row
+
+
+class SampleAPI(FakeAPI):
+    def __init__(self, markets: list[dict], trades: dict[str, list[dict]] | None = None):
+        super().__init__()
+        self.discovery_pages = [Page(markets, None)]
+        self.market_requests: list[tuple[str | None, bool]] = []
+        self.trade_requests: list[str] = []
+        self.trades = trades or {}
+
+    def markets_page(self, cursor=None, *, closed=False):
+        self.market_requests.append((cursor, closed))
+        return self.discovery_pages.pop(0)
+
+    def trades_page(self, **kwargs):
+        condition = kwargs["condition"]
+        self.trade_requests.append(condition)
+        return Page(self.trades.get(condition, []), None)
+
+
+class FakeEmbedder:
+    failures: list[str] = []
+
+    def __init__(self, vectors: dict[str, list[float]], device: str = "cpu"):
+        self.vectors = vectors
+        self.device = device
+        self.calls = 0
+
+    def iter_batches(self, texts):
+        self.calls += 1
+        yield self.device, [self.vectors[text] for text in texts]
+
+
+class SampledBackfillTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tempdir.name) / "sample.sqlite3")
+        self.db.initialize()
+
+    def tearDown(self):
+        self.db.close()
+        self.tempdir.cleanup()
+
+    def test_discovers_deduplicates_selects_and_keeps_zero_trade_markets(self):
+        rows = [
+            sampled_market("a", "Will Alpha win the award?", "Business", "event-alpha"),
+            sampled_market("b", "Does Alpha win this award?", "Business", "event-alpha"),
+            sampled_market("c", "Will Alpha receive the award?", "Business", "event-charlie"),
+            sampled_market("d", "Will rates be cut this year?", "Business", "event-delta"),
+        ]
+        vectors = {
+            normalize_title(rows[0]["question"]): [1.0, 0.0],
+            normalize_title(rows[1]["question"]): [1.0, 0.0],
+            normalize_title(rows[2]["question"]): [0.95, 0.3122499],
+            normalize_title(rows[3]["question"]): [0.0, 1.0],
+        }
+        api = SampleAPI(rows)
+        embedder = FakeEmbedder(vectors, "mps")
+        runner = SampledBackfill(
+            self.db,
+            Collector(self.db, api, clock=lambda: 2_000_100),
+            SampledBackfillConfig("balanced", days=1, markets_per_category=10),
+            clock=lambda: 2_000_100,
+            embedder=embedder,
+        )
+        self.assertEqual(runner.run(), 0)
+        self.assertEqual(api.market_requests, [(None, True)])
+        self.assertEqual(
+            self.db.row("SELECT phase FROM backfill_cohorts WHERE cohort_name='balanced'")[0],
+            "complete",
+        )
+        statuses = {
+            row["selection_status"]: row["n"]
+            for row in self.db.rows(
+                """SELECT selection_status,COUNT(*) n FROM backfill_cohort_markets
+                   GROUP BY selection_status"""
+            )
+        }
+        self.assertEqual(statuses, {"redundant": 2, "selected": 2})
+        self.assertEqual(
+            self.db.row("SELECT COUNT(*) FROM backfill_cohort_markets WHERE fetch_status='complete'")[0],
+            2,
+        )
+        self.assertEqual(
+            self.db.row("SELECT SUM(qualifying_trade_count) FROM backfill_cohort_markets")[0], 0
+        )
+        scores = [
+            row[0] for row in self.db.rows(
+                "SELECT similarity_ppm FROM backfill_cohort_markets WHERE selection_status='redundant'"
+            )
+        ]
+        self.assertIn(1_000_000, scores)
+        self.assertTrue(any(900_000 <= score < 1_000_000 for score in scores))
+        reasons = {
+            row[0] for row in self.db.rows(
+                "SELECT selection_reason FROM backfill_cohort_markets WHERE selection_status='redundant'"
+            )
+        }
+        self.assertTrue("semantic_similarity" in reasons)
+        self.assertTrue(reasons & {"same_event_id", "same_event_slug"})
+        self.assertEqual(
+            self.db.row("SELECT effective_device FROM backfill_cohorts")[0], "mps"
+        )
+        calls = embedder.calls
+        self.assertEqual(runner.run(), 0)
+        self.assertEqual(embedder.calls, calls)
+
+    def test_reuses_existing_trade_and_exports_only_selected_cohort(self):
+        raw_market = sampled_market("p1", "Will the bill pass?", "Elections", "event-politics")
+        raw_trade = trade(
+            "existing", condition="p1", asset="asset-p1", timestamp=2_000_000,
+            title=raw_market["question"], slug="p1",
+        )
+        api = SampleAPI([raw_market], {"p1": [raw_trade]})
+        collector = Collector(self.db, api, clock=lambda: 2_000_100)
+        collector.process_trade(
+            raw_trade, "backfill", self.db.start_run("backfill", 2_000_100), Counts(),
+            market_raw=raw_market,
+        )
+        runner = SampledBackfill(
+            self.db, collector, SampledBackfillConfig("politics", days=1),
+            clock=lambda: 2_000_100,
+            embedder=FakeEmbedder({normalize_title(raw_market["question"]): [1.0, 0.0]}),
+        )
+        self.assertEqual(runner.run(), 0)
+        self.assertEqual(self.db.row("SELECT COUNT(*) FROM trades")[0], 1)
+        selected = self.db.row("SELECT * FROM backfill_cohort_markets")
+        self.assertEqual(selected["canonical_category"], "politics")
+        self.assertEqual(selected["qualifying_trade_count"], 1)
+
+        output = Path(self.tempdir.name) / "exports"
+        _export(self.db, output, "politics")
+        for name in (
+            "cohort_markets.csv", "cohort_trades.csv", "cohort_similarity_rejections.csv",
+        ):
+            self.assertTrue((output / name).exists())
+        with (output / "cohort_trades.csv").open(encoding="utf-8") as handle:
+            self.assertEqual(len(list(csv.reader(handle))), 2)
+        _report(self.db, 1, "politics")
+
+    def test_inherits_legacy_window_and_rejects_configuration_changes(self):
+        self.db.save_checkpoint(
+            "market_backfill_90d", cursor=None, window_start=100, window_end=200,
+            last_trade_ts=None,
+        )
+        api = SampleAPI([])
+        collector = Collector(self.db, api, clock=lambda: 500)
+        runner = SampledBackfill(
+            self.db, collector, SampledBackfillConfig("frozen"), clock=lambda: 500,
+            embedder=FakeEmbedder({}),
+        )
+        cohort = runner._cohort()
+        self.assertEqual((cohort["window_start"], cohort["window_end"]), (100, 200))
+        changed = SampledBackfill(
+            self.db, collector, SampledBackfillConfig("frozen", seed=1), clock=lambda: 500,
+            embedder=FakeEmbedder({}),
+        )
+        with self.assertRaisesRegex(ValueError, "different configuration"):
+            changed._cohort()
+
+    def test_discovery_resumes_after_repeated_cursor(self):
+        first_api = SampleAPI([])
+        first_api.discovery_pages = [Page([], "same"), Page([], "same")]
+        config = SampledBackfillConfig("resume", days=1)
+        first = SampledBackfill(
+            self.db, Collector(self.db, first_api, clock=lambda: 2_000_100), config,
+            clock=lambda: 2_000_100, embedder=FakeEmbedder({}),
+        )
+        self.assertEqual(first.run(), 1)
+        failed = self.db.row("SELECT * FROM backfill_cohorts WHERE cohort_name='resume'")
+        self.assertEqual(failed["phase"], "discovering")
+        self.assertEqual(failed["discovery_cursor"], "same")
+
+        resumed_api = SampleAPI([])
+        resumed = SampledBackfill(
+            self.db, Collector(self.db, resumed_api, clock=lambda: 2_000_200), config,
+            clock=lambda: 2_000_200, embedder=FakeEmbedder({}),
+        )
+        self.assertEqual(resumed.run(), 0)
+        self.assertEqual(resumed_api.market_requests, [("same", True)])
+        self.assertEqual(self.db.row("SELECT phase FROM backfill_cohorts")[0], "complete")
+
+    def test_category_aliases_and_window_eligibility_are_persisted(self):
+        rows = [
+            sampled_market("e", "Economy question", "Economy", "event-e"),
+            sampled_market("w", "World question", "World", "event-w"),
+            sampled_market("p", "Election question", "Elections", "event-p"),
+            sampled_market("t", "Technology question", "Tech", "event-t"),
+            sampled_market("old", "Old finance question", "Finance", "event-old"),
+            sampled_market("future", "Future finance question", "Finance", "event-future"),
+        ]
+        rows[4]["endDate"] = "1970-01-01T00:00:01Z"
+        rows[5]["createdAt"] = "1970-02-01T00:00:00Z"
+        api = SampleAPI(rows)
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 2_000_100),
+            SampledBackfillConfig("categories", days=1), clock=lambda: 2_000_100,
+            embedder=FakeEmbedder({}),
+        )
+        cohort = runner._cohort()
+        runner.discover(cohort)
+        categories = {
+            row["condition_id"]: (row["canonical_category"], row["selection_status"], row["eligibility_reason"])
+            for row in self.db.rows("SELECT * FROM backfill_cohort_markets")
+        }
+        self.assertEqual(categories["e"][:2], ("finance", "candidate"))
+        self.assertEqual(categories["w"][:2], ("geopolitics", "candidate"))
+        self.assertEqual(categories["p"][:2], ("politics", "candidate"))
+        self.assertEqual(categories["t"][:2], (None, "not_target"))
+        self.assertEqual(categories["old"][2], "ended_before_window")
+        self.assertEqual(categories["future"][2], "created_after_window")
+
+
+class Availability:
+    def __init__(self, available: bool):
+        self.available = available
+
+    def is_available(self):
+        return self.available
+
+
+class FakeTorch:
+    class OutOfMemoryError(RuntimeError):
+        pass
+
+    def __init__(self, *, cuda: bool, mps: bool):
+        self.cuda = Availability(cuda)
+        self.backends = type("Backends", (), {"mps": Availability(mps)})()
+
+
+class EncodingModel:
+    def __init__(self, device: str, failures: set[str], calls: list[tuple[str, int]]):
+        self.device = device
+        self.failures = failures
+        self.calls = calls
+
+    def encode(self, texts, **kwargs):
+        self.calls.append((self.device, len(texts)))
+        if self.device in self.failures:
+            raise RuntimeError(f"{self.device} failed")
+        return [[1.0, 0.0] for _ in texts]
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    def _runner(self, torch, failures=(), requested="auto"):
+        loaded = []
+        calls = []
+
+        def load(_name, *, device):
+            loaded.append(device)
+            return EncodingModel(device, set(failures), calls)
+
+        runner = LocalSemanticEmbedder(
+            "test-model", requested, torch_module=torch, model_loader=load, batch_size=8,
+        )
+        return runner, loaded, calls
+
+    def test_cuda_is_preferred(self):
+        runner, loaded, _ = self._runner(FakeTorch(cuda=True, mps=True))
+        batches = list(runner.iter_batches(["one"]))
+        self.assertEqual(loaded, ["cuda"])
+        self.assertEqual(batches[0][0], "cuda")
+
+    def test_cuda_failure_falls_back_to_mps(self):
+        runner, loaded, _ = self._runner(FakeTorch(cuda=True, mps=True), {"cuda"})
+        batches = list(runner.iter_batches(["one"]))
+        self.assertEqual(loaded, ["cuda", "mps"])
+        self.assertEqual(batches[0][0], "mps")
+
+    def test_accelerator_failures_fall_back_to_cpu(self):
+        runner, loaded, _ = self._runner(
+            FakeTorch(cuda=True, mps=True), {"cuda", "mps"},
+        )
+        batches = list(runner.iter_batches(["one"]))
+        self.assertEqual(loaded, ["cuda", "mps", "cpu"])
+        self.assertEqual(batches[0][0], "cpu")
+
+    def test_mps_is_used_on_apple_silicon_when_cuda_is_absent(self):
+        runner, loaded, _ = self._runner(FakeTorch(cuda=False, mps=True))
+        self.assertEqual(list(runner.iter_batches(["one"]))[0][0], "mps")
+        self.assertEqual(loaded, ["mps"])
+
+    def test_explicit_unavailable_device_is_strict(self):
+        runner, _, _ = self._runner(FakeTorch(cuda=False, mps=True), requested="cuda")
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            list(runner.iter_batches(["one"]))
+
+    def test_out_of_memory_reduces_batch_size(self):
+        calls = []
+        torch = FakeTorch(cuda=True, mps=False)
+
+        class OOMModel:
+            def encode(self, texts, **kwargs):
+                calls.append(len(texts))
+                if len(texts) > 1:
+                    raise torch.OutOfMemoryError("out of memory")
+                return [[1.0, 0.0] for _ in texts]
+
+        runner = LocalSemanticEmbedder(
+            "test-model", "auto", torch_module=torch,
+            model_loader=lambda _name, device: OOMModel(), batch_size=8,
+        )
+        batches = list(runner.iter_batches(["one", "two", "three"]))
+        self.assertEqual(sum(len(vectors) for _, vectors in batches), 3)
+        self.assertIn(3, calls)
+        self.assertGreaterEqual(calls.count(1), 4)  # probe plus three retried rows
+
+
+if __name__ == "__main__":
+    unittest.main()
