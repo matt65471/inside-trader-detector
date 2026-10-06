@@ -23,10 +23,21 @@ TARGET_CATEGORIES = (
     "sports", "crypto", "weather", "culture", "finance", "geopolitics", "politics",
 )
 CATEGORY_ALIASES = {
+    "pop-culture": "culture",
     "elections": "politics",
     "economy": "finance",
     "business": "finance",
     "world": "geopolitics",
+}
+DISCOVERY_STRATEGY = "tag_filtered_v1"
+CATEGORY_TAG_SLUGS = {
+    "sports": ("sports",),
+    "crypto": ("crypto",),
+    "weather": ("weather",),
+    "culture": ("pop-culture",),
+    "finance": ("finance", "economy", "business"),
+    "geopolitics": ("geopolitics", "world"),
+    "politics": ("politics", "elections"),
 }
 
 
@@ -272,6 +283,7 @@ class SampledBackfill:
                 "category_limit": self.config.markets_per_category,
                 "seed": self.config.seed,
                 "admission_rate_ppm": self.admission_rate_ppm,
+                "discovery_strategy": DISCOVERY_STRATEGY,
                 "embedding_model": self.config.embedding_model,
                 "similarity_threshold_ppm": self.threshold_ppm,
                 "requested_device": self.config.embedding_device,
@@ -302,14 +314,15 @@ class SampledBackfill:
                 """INSERT INTO backfill_cohorts(
                        cohort_name,window_start,window_end,days,category_limit,seed,
                        embedding_model,similarity_threshold_ppm,requested_device,
-                       history_mode,admission_rate_ppm,
+                       history_mode,admission_rate_ppm,discovery_strategy,
                        resolution_required,resolution_status,phase,created_at,updated_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'discovering',?,?)""",
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'discovering',?,?)""",
                 (
                     self.config.cohort, start, end, self.config.days or 0,
                     self.config.markets_per_category, self.config.seed,
                     self.config.embedding_model, self.threshold_ppm,
                     self.config.embedding_device, self.history_mode, self.admission_rate_ppm,
+                    DISCOVERY_STRATEGY,
                     int(self.config.resolution_required),
                     "pending" if self.config.resolution_required else "not_required", now, now,
                 ),
@@ -604,6 +617,97 @@ class SampledBackfill:
             for category in TARGET_CATEGORIES
         )
 
+    def _ensure_discovery_streams(self) -> list[Mapping[str, Any]]:
+        existing = {
+            row["tag_slug"]: row for row in self.db.rows(
+                "SELECT * FROM backfill_cohort_discovery_streams WHERE cohort_name=?",
+                (self.config.cohort,),
+            )
+        }
+        for category in TARGET_CATEGORIES:
+            for slug in CATEGORY_TAG_SLUGS[category]:
+                row = existing.get(slug)
+                if row:
+                    if row["canonical_category"] != category:
+                        raise ValueError(
+                            f"Persisted Gamma tag {slug!r} belongs to "
+                            f"{row['canonical_category']!r}, expected {category!r}"
+                        )
+                    continue
+                tag = self.collector.api.tag_by_slug(slug)
+                tag_id = str(tag.get("id", "")).strip()
+                if not tag_id.isdigit():
+                    raise APIError(f"Gamma tag {slug!r} has no numeric ID")
+                with self.db.connection:
+                    self.db.connection.execute(
+                        """INSERT INTO backfill_cohort_discovery_streams(
+                               cohort_name,canonical_category,tag_slug,tag_id,updated_at
+                           ) VALUES (?,?,?,?,?)""",
+                        (self.config.cohort, category, slug, tag_id, int(self.clock())),
+                    )
+                print(f"Resolved Gamma tag {slug}={tag_id} for {category}", flush=True)
+        rows = self.db.rows(
+            "SELECT * FROM backfill_cohort_discovery_streams WHERE cohort_name=?",
+            (self.config.cohort,),
+        )
+        category_order = {category: index for index, category in enumerate(TARGET_CATEGORIES)}
+        slug_order = {
+            slug: index
+            for category in TARGET_CATEGORIES
+            for index, slug in enumerate(CATEGORY_TAG_SLUGS[category])
+        }
+        return sorted(
+            rows,
+            key=lambda row: (category_order[row["canonical_category"]], slug_order[row["tag_slug"]]),
+        )
+
+    def _save_discovery_stream_page(
+        self, stream: Mapping[str, Any], next_cursor: str | None,
+    ) -> None:
+        now = int(self.clock())
+        with self.db.connection:
+            self.db.connection.execute(
+                """UPDATE backfill_cohort_discovery_streams
+                   SET cursor=?,pages_fetched=pages_fetched+1,exhausted=?,last_error=NULL,updated_at=?
+                   WHERE cohort_name=? AND tag_slug=?""",
+                (
+                    next_cursor, int(not next_cursor), now,
+                    self.config.cohort, stream["tag_slug"],
+                ),
+            )
+            self.db.connection.execute(
+                """UPDATE backfill_cohorts
+                   SET discovery_pages=discovery_pages+1,last_error=NULL,updated_at=?
+                   WHERE cohort_name=?""",
+                (now, self.config.cohort),
+            )
+
+    def _tagged_page(
+        self, stream: Mapping[str, Any], seen: dict[str, set[str | None]],
+    ) -> Any:
+        slug = stream["tag_slug"]
+        cursor = stream["cursor"]
+        if cursor in seen.setdefault(slug, set()):
+            raise APIError(f"Gamma repeated a discovery cursor for tag {slug}")
+        seen[slug].add(cursor)
+        print(
+            f"Streaming {stream['canonical_category']} tag={slug} "
+            f"({stream['tag_id']}) cursor={cursor or 'start'}",
+            flush=True,
+        )
+        try:
+            return self.collector.api.markets_page(
+                cursor, closed=True, tag_id=stream["tag_id"],
+            )
+        except Exception as exc:
+            with self.db.connection:
+                self.db.connection.execute(
+                    """UPDATE backfill_cohort_discovery_streams
+                       SET last_error=?,updated_at=? WHERE cohort_name=? AND tag_slug=?""",
+                    (str(exc), int(self.clock()), self.config.cohort, slug),
+                )
+            raise
+
     def stream_select(
         self,
         *,
@@ -637,54 +741,59 @@ class SampledBackfill:
             return
 
         state = self._selected_state()
-        cursor = cohort["discovery_cursor"]
+        self._ensure_discovery_streams()
         ordinal_row = self.db.row(
             "SELECT COALESCE(MAX(discovery_ordinal),0) n FROM backfill_cohort_markets WHERE cohort_name=?",
             (self.config.cohort,),
         )
         ordinal = int(ordinal_row["n"])
-        seen: set[str | None] = set()
+        seen: dict[str, set[str | None]] = {}
         exhausted = False
         while not self._quotas_full(state):
-            if cursor in seen:
-                raise APIError("Gamma repeated a sampled discovery cursor")
-            seen.add(cursor)
-            print(f"Streaming discovery page cursor={cursor or 'start'}", flush=True)
-            page = self.collector.api.markets_page(cursor, closed=True)
-            candidates: list[str] = []
-            for raw in page.rows:
-                ordinal += 1
-                row = self._discover_market(raw, 1, int(cohort["window_end"]), ordinal)
-                if not row or not row["eligible"]:
+            progressed = False
+            streams = self._ensure_discovery_streams()
+            for stream in streams:
+                category = stream["canonical_category"]
+                if stream["exhausted"] or (
+                    len(state[category]["ids"]) >= self.config.markets_per_category
+                ):
                     continue
-                category = row["canonical_category"]
-                if len(state[category]["ids"]) >= self.config.markets_per_category:
-                    continue
-                if row["selection_status"] == "selected":
-                    continue
-                if row["selection_status"] in ("redundant", "ineligible"):
-                    continue
-                admitted = self._admitted(row["random_rank"])
-                with self.db.connection:
-                    self.db.connection.execute(
-                        """UPDATE backfill_cohort_markets SET admission_passed=?,
-                                  selection_status=CASE WHEN ? THEN 'candidate' ELSE 'not_selected' END,
-                                  selection_reason=CASE WHEN ? THEN NULL ELSE 'random_reject' END
-                           WHERE cohort_name=? AND condition_id=?""",
-                        (int(admitted), int(admitted), int(admitted), self.config.cohort,
-                         row["condition_id"]),
-                    )
-                if admitted:
-                    candidates.append(row["condition_id"])
-            if prepare_candidates is not None and candidates:
-                prepare_candidates(candidates)
-            self._ensure_embeddings_for(candidates)
-            for condition in candidates:
-                self._select_streaming_row(condition, state, on_selected)
-            pages = int(self._cohort()["discovery_pages"]) + 1
-            cursor = page.next_cursor
-            self._update_cohort(discovery_cursor=cursor, discovery_pages=pages, last_error=None)
-            if not cursor:
+                progressed = True
+                page = self._tagged_page(stream, seen)
+                candidates: list[str] = []
+                for raw in page.rows:
+                    ordinal += 1
+                    row = self._discover_market(raw, 1, int(cohort["window_end"]), ordinal)
+                    if not row or not row["eligible"]:
+                        continue
+                    candidate_category = row["canonical_category"]
+                    if len(state[candidate_category]["ids"]) >= self.config.markets_per_category:
+                        continue
+                    if row["selection_status"] == "selected":
+                        continue
+                    if row["selection_status"] in ("redundant", "ineligible"):
+                        continue
+                    admitted = self._admitted(row["random_rank"])
+                    with self.db.connection:
+                        self.db.connection.execute(
+                            """UPDATE backfill_cohort_markets SET admission_passed=?,
+                                      selection_status=CASE WHEN ? THEN 'candidate' ELSE 'not_selected' END,
+                                      selection_reason=CASE WHEN ? THEN NULL ELSE 'random_reject' END
+                               WHERE cohort_name=? AND condition_id=?""",
+                            (int(admitted), int(admitted), int(admitted), self.config.cohort,
+                             row["condition_id"]),
+                        )
+                    if admitted:
+                        candidates.append(row["condition_id"])
+                if prepare_candidates is not None and candidates:
+                    prepare_candidates(candidates)
+                self._ensure_embeddings_for(candidates)
+                for condition in candidates:
+                    self._select_streaming_row(condition, state, on_selected)
+                self._save_discovery_stream_page(stream, page.next_cursor)
+                if self._quotas_full(state):
+                    break
+            if not progressed:
                 exhausted = True
                 break
 
@@ -712,7 +821,7 @@ class SampledBackfill:
 
         stop_reason = "quotas_filled" if self._quotas_full(state) else "gamma_exhausted"
         self._update_cohort(
-            discovery_complete=1, discovery_stop_reason=stop_reason,
+            discovery_cursor=None, discovery_complete=1, discovery_stop_reason=stop_reason,
             resolution_status=("complete" if self.config.resolution_required else "not_required"),
             phase="fetching", last_error=None,
         )
@@ -720,23 +829,24 @@ class SampledBackfill:
     def discover(self, cohort: Mapping[str, Any]) -> None:
         if cohort["discovery_complete"]:
             return
-        cursor = cohort["discovery_cursor"]
-        seen: set[str | None] = set()
+        self._ensure_discovery_streams()
+        seen: dict[str, set[str | None]] = {}
         start, end = int(cohort["window_start"]), int(cohort["window_end"])
         while True:
-            if cursor in seen:
-                raise APIError("Gamma repeated a sampled discovery cursor")
-            seen.add(cursor)
-            print(f"Sampled discovery page cursor={cursor or 'start'}", flush=True)
-            page = self.collector.api.markets_page(cursor, closed=True)
-            for raw in page.rows:
-                self._discover_market(raw, start, end)
-            cursor = page.next_cursor
-            if cursor:
-                self._update_cohort(discovery_cursor=cursor, last_error=None)
+            progressed = False
+            for stream in self._ensure_discovery_streams():
+                if stream["exhausted"]:
+                    continue
+                progressed = True
+                page = self._tagged_page(stream, seen)
+                for raw in page.rows:
+                    self._discover_market(raw, start, end)
+                self._save_discovery_stream_page(stream, page.next_cursor)
+            if progressed:
                 continue
             self._update_cohort(
-                discovery_cursor=None, discovery_complete=1, phase="embedding", last_error=None,
+                discovery_cursor=None, discovery_complete=1, discovery_stop_reason="tags_exhausted",
+                phase="embedding", last_error=None,
             )
             return
 

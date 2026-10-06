@@ -47,6 +47,23 @@ class APITests(unittest.TestCase):
         self.assertEqual(PolymarketAPI(http).market("condition-1")["conditionId"], "condition-1")
         self.assertEqual([call[2]["closed"] for call in http.calls], ["false", "true"])
 
+    def test_gamma_tag_lookup_and_filtered_market_page(self) -> None:
+        class GammaHTTP(RecordingHTTP):
+            def get_json(self, base, path, params=None):
+                self.calls.append((base, path, params))
+                if path == "/tags/slug/pop-culture":
+                    return {"id": "596", "slug": "pop-culture", "label": "Culture"}
+                return {"markets": [market()], "next_cursor": "next"}
+
+        http = GammaHTTP(None)
+        api = PolymarketAPI(http)
+        self.assertEqual(api.tag_by_slug("pop-culture")["id"], "596")
+        page = api.markets_page(closed=True, tag_id="596")
+        self.assertEqual(page.next_cursor, "next")
+        self.assertEqual(http.calls[1][1], "/markets/keyset")
+        self.assertEqual(http.calls[1][2]["tag_id"], "596")
+        self.assertEqual(http.calls[1][2]["closed"], "true")
+
     def test_v2_page_and_cursor(self) -> None:
         http = RecordingHTTP(
             {"data": [{"id": "one"}], "pagination": {"next_cursor": "cursor-2"}}
@@ -183,6 +200,7 @@ class CLITests(unittest.TestCase):
                     "pending_work",
                     "collection_errors",
                     "backfill_cohorts",
+                    "backfill_cohort_discovery_streams",
                     "backfill_cohort_markets",
                     "semantic_embeddings",
                     "jobs",

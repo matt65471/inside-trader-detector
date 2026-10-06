@@ -234,8 +234,22 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
         )
         print(
             f"  discovery pages={selected['discovery_pages']} "
+            f"strategy={selected['discovery_strategy']} "
             f"stop={selected['discovery_stop_reason'] or 'in_progress'}"
         )
+        for stream in db.rows(
+            """SELECT canonical_category,tag_slug,tag_id,pages_fetched,exhausted,last_error
+               FROM backfill_cohort_discovery_streams WHERE cohort_name=?
+               ORDER BY canonical_category,tag_slug""",
+            (cohort,),
+        ):
+            error_suffix = f" error={stream['last_error']}" if stream["last_error"] else ""
+            print(
+                f"  discovery {stream['canonical_category']} tag={stream['tag_slug']}"
+                f"({stream['tag_id']}): pages={stream['pages_fetched']} "
+                f"status={'exhausted' if stream['exhausted'] else 'active'}"
+                f"{error_suffix}"
+            )
         if selected["last_error"]:
             print(f"  last note/error: {selected['last_error']}")
         if selected["embedding_device_log"] and selected["embedding_device_log"] != "[]":

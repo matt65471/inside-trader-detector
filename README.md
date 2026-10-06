@@ -67,15 +67,25 @@ python -m informed_flow sampled-backfill --cohort balanced-lifetime \
   --embedding-device auto
 ```
 
-`sampled-backfill` scans closed Gamma markets in recent-first API order and stops
-as soon as every category reaches its target. It maps elections to politics,
-economy/business to finance, and world to geopolitics. A seeded 50% admission
-decision spreads the sample farther through recent history; admitted markets are
-embedded immediately. Markets from the same event and titles with embedding
-cosine similarity of at least 0.90 are rejected, and scanning continues until the
-quota is filled. If Gamma is exhausted, random rejects are reconsidered in
-discovery order so randomness cannot reduce the attainable final count. The
-result is `min(target, available nonredundant markets)` per category.
+`sampled-backfill` resolves Gamma's numeric tag IDs and scans separate closed-market
+keyset feeds for sports, crypto, weather, pop-culture, finance, geopolitics, and
+politics. Alias feeds merge elections into politics, economy/business into finance,
+and world into geopolitics. Each tag has its own durable cursor, so sparse categories
+do not wait behind unrelated sports pages and interrupted runs resume each feed
+independently. Overlapping tag results are deduplicated locally by condition ID.
+
+Feeds are processed in recent-first API order and stop as soon as every category
+reaches its target. A seeded 50% admission decision spreads the sample farther
+through recent history; admitted markets are embedded immediately. Markets from
+the same event and titles with embedding cosine similarity of at least 0.90 are
+rejected, and scanning continues until the quota is filled. If all relevant tag
+feeds are exhausted, random rejects are reconsidered in discovery order so
+randomness cannot reduce the attainable final count. The result is
+`min(target, available nonredundant tagged markets)` per category.
+
+Discovery strategy is part of the immutable cohort configuration. If a cohort was
+started by an older release using the unfiltered global Gamma scan, start this
+version with a new `--cohort` name; it will refuse to mix the two strategies.
 
 Selected markets collect all API-served qualifying trades through the cohort's
 frozen creation time, rather than only the latest 90 days. Trade workers run while

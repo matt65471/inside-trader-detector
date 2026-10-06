@@ -75,13 +75,15 @@ section for the current status, while retaining that document's research scope.
 - Historical order books are not recoverable from these trades and are marked
   `historical_unavailable`. Live collection attempts book snapshots for trades
   worth at least $1,000. Completed-trade price is not a follower's executable ask.
-- New `sampled-backfill` cohorts stream closed markets in recent-first Gamma order,
-  use a deterministic seeded 50% admission decision, and stop when every category
-  reaches its quota. Same-event and >=0.90 embedding matches are rejected. If Gamma
-  is exhausted, random rejects are reconsidered so the final count is
-  `min(limit, available nonredundant markets)`. Selected markets collect all
-  API-served qualifying trades through a frozen cohort cutoff. Existing bounded
-  `--days` cohorts retain their original behavior and configuration.
+- New `sampled-backfill` cohorts resolve Gamma tag slugs to numeric IDs and stream
+  separate closed-market feeds for all seven categories and their aliases. Each tag
+  has a durable cursor; overlapping results deduplicate by condition ID. A seeded
+  50% admission decision is made as markets arrive until every category reaches its
+  quota. Same-event and >=0.90 embedding matches are rejected. If the relevant tag
+  feeds exhaust, random rejects are reconsidered so the final count is
+  `min(limit, available nonredundant tagged markets)`. Selected markets collect all
+  API-served qualifying trades through a frozen cohort cutoff. Discovery strategy
+  is immutable; older global-scan cohorts require a new cohort name.
 - `run --cohort NAME` automates resolved lifetime cohorts. It verifies terminal Data
   API resolutions before immediate embedding/selection, scans newly selected markets
   concurrently with continued discovery, enriches the selected subset, and labels
@@ -100,8 +102,8 @@ section for the current status, while retaining that document's research scope.
 - Phase 2 historical labeling and gross-profit calculation are implemented. Model
   training, profitability claims, and paper trading are **not implemented**. Do not
   train a model to reproduce the heuristic score.
-- The summary-only, streaming sampled-backfill, queue, resolution, and labeling
-  implementation was verified with 66 local tests. Update the validation record
+- The summary-only, tag-filtered streaming sampled-backfill, queue, resolution, and
+  labeling implementation was verified with 68 local tests. Update the validation record
   when subsequent code changes introduce new checks.
 
 ## Checkout and database locations

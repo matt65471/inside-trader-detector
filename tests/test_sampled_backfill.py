@@ -9,6 +9,7 @@ from informed_flow.api import Page
 from informed_flow.cli import _export, _report
 from informed_flow.db import Database
 from informed_flow.sampled_backfill import (
+    CATEGORY_TAG_SLUGS,
     LocalSemanticEmbedder,
     SampledBackfill,
     SampledBackfillConfig,
@@ -47,14 +48,39 @@ def sampled_market(
 class SampleAPI(FakeAPI):
     def __init__(self, markets: list[dict], trades: dict[str, list[dict]] | None = None):
         super().__init__()
-        self.discovery_pages = [Page(markets, None)]
-        self.market_requests: list[tuple[str | None, bool]] = []
+        self.discovery_pages: list[Page] | None = None
+        self.tag_ids = {
+            slug: str(index + 1)
+            for index, slug in enumerate(
+                slug for slugs in CATEGORY_TAG_SLUGS.values() for slug in slugs
+            )
+        }
+        category_slug = {
+            "sports": "sports", "crypto": "crypto", "weather": "weather",
+            "culture": "pop-culture", "pop-culture": "pop-culture",
+            "finance": "finance", "economy": "economy", "business": "business",
+            "geopolitics": "geopolitics", "world": "world",
+            "politics": "politics", "elections": "elections",
+        }
+        self.markets_by_tag = {tag_id: [] for tag_id in self.tag_ids.values()}
+        for row in markets:
+            events = row.get("events") or []
+            category = str((events[0] if events else {}).get("category", "")).lower()
+            slug = category_slug.get(category)
+            if slug:
+                self.markets_by_tag[self.tag_ids[slug]].append(row)
+        self.market_requests: list[tuple[str | None, bool, str | None]] = []
         self.trade_requests: list[str] = []
         self.trades = trades or {}
 
-    def markets_page(self, cursor=None, *, closed=False):
-        self.market_requests.append((cursor, closed))
-        return self.discovery_pages.pop(0)
+    def tag_by_slug(self, slug):
+        return {"id": self.tag_ids[slug], "slug": slug}
+
+    def markets_page(self, cursor=None, *, closed=False, tag_id=None):
+        self.market_requests.append((cursor, closed, str(tag_id) if tag_id is not None else None))
+        if self.discovery_pages is not None and str(tag_id) == self.tag_ids["sports"]:
+            return self.discovery_pages.pop(0)
+        return Page(self.markets_by_tag[str(tag_id)], None)
 
     def trades_page(self, **kwargs):
         condition = kwargs["condition"]
@@ -108,7 +134,8 @@ class SampledBackfillTests(unittest.TestCase):
             embedder=embedder,
         )
         self.assertEqual(runner.run(), 0)
-        self.assertEqual(api.market_requests, [(None, True)])
+        self.assertEqual(len(api.market_requests), 11)
+        self.assertTrue(all(closed and tag_id for _, closed, tag_id in api.market_requests))
         self.assertEqual(
             self.db.row("SELECT phase FROM backfill_cohorts WHERE cohort_name='balanced'")[0],
             "complete",
@@ -208,6 +235,28 @@ class SampledBackfillTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "resolution_required"):
             resolution_changed._cohort()
+        with self.db.connection:
+            self.db.connection.execute(
+                "UPDATE backfill_cohorts SET discovery_strategy='global_v1' WHERE cohort_name='frozen'"
+            )
+        with self.assertRaisesRegex(ValueError, "discovery_strategy"):
+            runner._cohort()
+
+    def test_overlapping_tag_results_are_stored_once(self):
+        raw = sampled_market(
+            "overlap", "Will rates change?", "Finance", "event-overlap",
+        )
+        api = SampleAPI([raw])
+        api.markets_by_tag[api.tag_ids["economy"]] = [raw]
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 2_000_100),
+            SampledBackfillConfig("overlap", days=1), clock=lambda: 2_000_100,
+            embedder=FakeEmbedder({}),
+        )
+        runner.discover(runner._cohort())
+        self.assertEqual(
+            self.db.row("SELECT COUNT(*) n FROM backfill_cohort_markets")["n"], 1,
+        )
 
     def test_discovery_resumes_after_repeated_cursor(self):
         first_api = SampleAPI([])
@@ -220,7 +269,10 @@ class SampledBackfillTests(unittest.TestCase):
         self.assertEqual(first.run(), 1)
         failed = self.db.row("SELECT * FROM backfill_cohorts WHERE cohort_name='resume'")
         self.assertEqual(failed["phase"], "discovering")
-        self.assertEqual(failed["discovery_cursor"], "same")
+        stream = self.db.row(
+            "SELECT * FROM backfill_cohort_discovery_streams WHERE tag_slug='sports'"
+        )
+        self.assertEqual(stream["cursor"], "same")
 
         resumed_api = SampleAPI([])
         resumed = SampledBackfill(
@@ -228,7 +280,7 @@ class SampledBackfillTests(unittest.TestCase):
             clock=lambda: 2_000_200, embedder=FakeEmbedder({}),
         )
         self.assertEqual(resumed.run(), 0)
-        self.assertEqual(resumed_api.market_requests, [("same", True)])
+        self.assertEqual(resumed_api.market_requests[0], ("same", True, "1"))
         self.assertEqual(self.db.row("SELECT phase FROM backfill_cohorts")[0], "complete")
 
     def test_category_aliases_and_window_eligibility_are_persisted(self):
@@ -236,12 +288,11 @@ class SampledBackfillTests(unittest.TestCase):
             sampled_market("e", "Economy question", "Economy", "event-e"),
             sampled_market("w", "World question", "World", "event-w"),
             sampled_market("p", "Election question", "Elections", "event-p"),
-            sampled_market("t", "Technology question", "Tech", "event-t"),
             sampled_market("old", "Old finance question", "Finance", "event-old"),
             sampled_market("future", "Future finance question", "Finance", "event-future"),
         ]
-        rows[4]["endDate"] = "1970-01-01T00:00:01Z"
-        rows[5]["createdAt"] = "1970-02-01T00:00:00Z"
+        rows[3]["endDate"] = "1970-01-01T00:00:01Z"
+        rows[4]["createdAt"] = "1970-02-01T00:00:00Z"
         api = SampleAPI(rows)
         runner = SampledBackfill(
             self.db, Collector(self.db, api, clock=lambda: 2_000_100),
@@ -257,7 +308,6 @@ class SampledBackfillTests(unittest.TestCase):
         self.assertEqual(categories["e"][:2], ("finance", "candidate"))
         self.assertEqual(categories["w"][:2], ("geopolitics", "candidate"))
         self.assertEqual(categories["p"][:2], ("politics", "candidate"))
-        self.assertEqual(categories["t"][:2], (None, "not_target"))
         self.assertEqual(categories["old"][2], "ended_before_window")
         self.assertEqual(categories["future"][2], "created_after_window")
 
@@ -284,7 +334,7 @@ class SampledBackfillTests(unittest.TestCase):
             clock=lambda: 10_000_000, embedder=FakeEmbedder(vectors),
         )
         runner.stream_select()
-        self.assertEqual(api.market_requests, [(None, True)])
+        self.assertEqual(api.market_requests, [(None, True, "1")])
         cohort = self.db.row("SELECT * FROM backfill_cohorts")
         self.assertEqual(cohort["history_mode"], "lifetime")
         self.assertEqual(cohort["window_start"], 1)

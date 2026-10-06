@@ -142,10 +142,26 @@ class PolymarketAPI:
             cursor = page.next_cursor
         raise HistoryTruncated("Wallet history exceeded 100 pages; recent-window sample is truncated")
 
-    def markets_page(self, cursor: str | None = None, *, closed: bool = False, limit: int = 100) -> Page:
+    def tag_by_slug(self, slug: str) -> dict[str, Any]:
+        payload = self.http.get_json(
+            self.GAMMA_BASE, f"/tags/slug/{urllib.parse.quote(slug, safe='')}",
+        )
+        if not isinstance(payload, Mapping) or not payload.get("id"):
+            raise APIError(f"Gamma tag {slug!r} has an unexpected shape")
+        return dict(payload)
+
+    def markets_page(
+        self,
+        cursor: str | None = None,
+        *,
+        closed: bool = False,
+        limit: int = 100,
+        tag_id: str | int | None = None,
+    ) -> Page:
         payload = self.http.get_json(self.GAMMA_BASE, "/markets/keyset", {
             "limit": limit, "after_cursor": cursor, "order": "id", "ascending": "false",
             "include_tag": "true", "closed": "true" if closed else "false",
+            "tag_id": tag_id,
         })
         if not isinstance(payload, Mapping) or not isinstance(payload.get("markets"), list):
             raise APIError("Gamma keyset market listing has an unexpected shape")

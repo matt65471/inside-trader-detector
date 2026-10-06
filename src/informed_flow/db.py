@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -318,6 +318,7 @@ CREATE TABLE IF NOT EXISTS backfill_cohorts (
     admission_rate_ppm INTEGER NOT NULL DEFAULT 1000000,
     discovery_pages INTEGER NOT NULL DEFAULT 0,
     discovery_stop_reason TEXT,
+    discovery_strategy TEXT NOT NULL DEFAULT 'tag_filtered_v1',
     resolution_required INTEGER NOT NULL DEFAULT 0 CHECK (resolution_required IN (0,1)),
     resolution_status TEXT NOT NULL DEFAULT 'not_required',
     phase TEXT NOT NULL CHECK (
@@ -329,6 +330,21 @@ CREATE TABLE IF NOT EXISTS backfill_cohorts (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS backfill_cohort_discovery_streams (
+    cohort_name TEXT NOT NULL REFERENCES backfill_cohorts(cohort_name) ON DELETE CASCADE,
+    canonical_category TEXT NOT NULL,
+    tag_slug TEXT NOT NULL,
+    tag_id TEXT NOT NULL,
+    cursor TEXT,
+    pages_fetched INTEGER NOT NULL DEFAULT 0,
+    exhausted INTEGER NOT NULL DEFAULT 0 CHECK (exhausted IN (0,1)),
+    last_error TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(cohort_name,tag_slug)
+);
+CREATE INDEX IF NOT EXISTS idx_cohort_discovery_streams_pending
+    ON backfill_cohort_discovery_streams(cohort_name,canonical_category,exhausted);
 
 CREATE TABLE IF NOT EXISTS backfill_cohort_markets (
     cohort_name TEXT NOT NULL REFERENCES backfill_cohorts(cohort_name) ON DELETE CASCADE,
@@ -498,6 +514,7 @@ class Database:
                 ("admission_rate_ppm", "INTEGER NOT NULL DEFAULT 1000000"),
                 ("discovery_pages", "INTEGER NOT NULL DEFAULT 0"),
                 ("discovery_stop_reason", "TEXT"),
+                ("discovery_strategy", "TEXT NOT NULL DEFAULT 'global_v1'"),
             ):
                 self._ensure_column("backfill_cohorts", name, declaration)
             for name, declaration in (

@@ -399,6 +399,10 @@ class MigrationTests(unittest.TestCase):
             self.assertTrue({
                 "resolution_required", "resolution_status", "history_mode",
                 "admission_rate_ppm", "discovery_pages", "discovery_stop_reason",
+                "discovery_strategy",
             } <= cohort_columns)
             self.assertIsNotNone(db.row("SELECT 1 FROM sqlite_master WHERE name='jobs'"))
+            self.assertIsNotNone(db.row(
+                "SELECT 1 FROM sqlite_master WHERE name='backfill_cohort_discovery_streams'"
+            ))
             db.close()
