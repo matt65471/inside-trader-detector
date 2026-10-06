@@ -329,9 +329,24 @@ class SampledBackfill:
         self, raw: Mapping[str, Any], start: int, end: int, ordinal: int | None = None,
     ) -> Mapping[str, Any]:
         condition = first(raw, "conditionId", "condition_id")
-        if not condition:
-            raise APIError("Gamma listing contains a market without a condition ID")
-        condition = str(condition).lower()
+        if not condition or not str(condition).strip():
+            self.db.record_error(
+                None, "sampled_discovery",
+                canonical_json({
+                    "cohort": self.config.cohort,
+                    "reason": "missing_condition_id",
+                    "raw_market": raw,
+                }),
+                endpoint="/markets", entity_type="market",
+                entity_id=str(raw.get("id")) if raw.get("id") is not None else None,
+            )
+            print(
+                f"Skipping Gamma market id={raw.get('id')}: missing condition ID "
+                "(raw listing retained in collection_errors)",
+                flush=True,
+            )
+            return
+        condition = str(condition).strip().lower()
         event = _event(raw)
         title = str(first(raw, "question", "title", default="")).strip()
         created = parse_timestamp(first(raw, "createdAt", "created_at"))
