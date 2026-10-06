@@ -75,16 +75,18 @@ section for the current status, while retaining that document's research scope.
 - Historical order books are not recoverable from these trades and are marked
   `historical_unavailable`. Live collection attempts book snapshots for trades
   worth at least $1,000. Completed-trade price is not a follower's executable ask.
-- `sampled-backfill` builds a separate, durable cohort from closed markets. It
-  selects up to 1,000 nonredundant markets per canonical category using a seeded
-  rank, one-market-per-event filtering, and cached local title embeddings. Existing
-  trades remain intact. CUDA, Apple MPS, and CPU embedding are supported with
-  automatic accelerator fallback; the semantic dependency is optional.
-- `run --cohort NAME --days 90` automates resolved historical cohorts. It verifies
-  terminal Data API resolutions before embeddings and selection, then concurrently
-  scans markets, enriches the existing selected subset, and labels every qualifying
-  cohort trade at +15 minutes, +1 hour, and +24 hours. Live polling remains opt-in
-  through `--live`.
+- New `sampled-backfill` cohorts stream closed markets in recent-first Gamma order,
+  use a deterministic seeded 50% admission decision, and stop when every category
+  reaches its quota. Same-event and >=0.90 embedding matches are rejected. If Gamma
+  is exhausted, random rejects are reconsidered so the final count is
+  `min(limit, available nonredundant markets)`. Selected markets collect all
+  API-served qualifying trades through a frozen cohort cutoff. Existing bounded
+  `--days` cohorts retain their original behavior and configuration.
+- `run --cohort NAME` automates resolved lifetime cohorts. It verifies terminal Data
+  API resolutions before immediate embedding/selection, scans newly selected markets
+  concurrently with continued discovery, enriches the selected subset, and labels
+  every qualifying cohort trade at +15 minutes, +1 hour, and +24 hours. Live polling
+  remains opt-in through `--live`.
 - The SQLite queue uses unique job keys, leases, crash recovery, eight attempts,
   exponential backoff, and dead-letter reporting. Trade insertion atomically adds
   downstream work, while startup reconciliation repairs missing jobs from
@@ -98,9 +100,9 @@ section for the current status, while retaining that document's research scope.
 - Phase 2 historical labeling and gross-profit calculation are implemented. Model
   training, profitability claims, and paper trading are **not implemented**. Do not
   train a model to reproduce the heuristic score.
-- The summary-only, sampled-backfill, queue, resolution, and labeling implementation
-  was verified with 59 local tests. Update the validation record when subsequent
-  code changes introduce new checks.
+- The summary-only, streaming sampled-backfill, queue, resolution, and labeling
+  implementation was verified with 65 local tests. Update the validation record
+  when subsequent code changes introduce new checks.
 
 ## Checkout and database locations
 

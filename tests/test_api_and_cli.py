@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from informed_flow.api import APIError, HistoryTruncated, Page, PolymarketAPI
-from informed_flow.cli import _backfill, main
+from informed_flow.cli import _backfill, build_parser, main
 from informed_flow.db import Database
 from informed_flow.service import Collector
 from tests.test_service import FakeAPI, market, trade
@@ -97,6 +97,14 @@ class APITests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_balanced_commands_default_to_lifetime_streaming(self) -> None:
+        parser = build_parser()
+        sampled = parser.parse_args(["sampled-backfill", "--cohort", "sample"])
+        automated = parser.parse_args(["run", "--cohort", "resolved"])
+        self.assertIsNone(sampled.days)
+        self.assertIsNone(automated.days)
+        self.assertEqual((sampled.admission_rate, automated.admission_rate), (0.5, 0.5))
+
     def test_market_backfill_resumes_partial_run_with_frozen_window(self) -> None:
         class HistoricalAPI(FakeAPI):
             def __init__(self):

@@ -21,8 +21,8 @@ Run directly from the checkout:
 export PYTHONPATH=src
 python -m informed_flow init
 python -m informed_flow backfill --days 90
-python -m informed_flow sampled-backfill --cohort balanced-90d --days 90
-python -m informed_flow run --cohort balanced-resolved-90d --days 90
+python -m informed_flow sampled-backfill --cohort balanced-lifetime
+python -m informed_flow run --cohort balanced-resolved-lifetime
 python -m informed_flow watch
 ```
 
@@ -45,8 +45,8 @@ All commands accept `--db PATH` before the subcommand. The default database is
 ```shell
 python -m informed_flow init
 python -m informed_flow backfill --days 90
-python -m informed_flow sampled-backfill --cohort balanced-90d --days 90
-python -m informed_flow run --cohort balanced-resolved-90d --days 90
+python -m informed_flow sampled-backfill --cohort balanced-lifetime
+python -m informed_flow run --cohort balanced-resolved-lifetime
 python -m informed_flow watch --once
 python -m informed_flow watch --interval 60
 python -m informed_flow enrich
@@ -61,19 +61,27 @@ model support first:
 
 ```shell
 python -m pip install -e ".[semantic]"
-python -m informed_flow sampled-backfill --cohort balanced-90d --days 90 \
-  --markets-per-category 1000 --seed 0 --similarity-threshold 0.90 \
+python -m informed_flow sampled-backfill --cohort balanced-lifetime \
+  --markets-per-category 1000 --admission-rate 0.50 --seed 0 \
+  --similarity-threshold 0.90 --market-workers 2 \
   --embedding-device auto
 ```
 
-`sampled-backfill` first discovers closed markets whose known lifetime overlaps
-the frozen window. It maps elections to politics, economy/business to finance,
-and world to geopolitics, then selects up to 1,000 nonredundant markets in each
-of sports, crypto, weather, culture, finance, geopolitics, and politics. Markets
-from the same event and titles with embedding cosine similarity of at least 0.90
-are treated as redundant. The random ordering, semantic decisions, and chosen
-markets are durable and reproducible for a cohort. Markets with no qualifying
-trades remain part of the sample.
+`sampled-backfill` scans closed Gamma markets in recent-first API order and stops
+as soon as every category reaches its target. It maps elections to politics,
+economy/business to finance, and world to geopolitics. A seeded 50% admission
+decision spreads the sample farther through recent history; admitted markets are
+embedded immediately. Markets from the same event and titles with embedding
+cosine similarity of at least 0.90 are rejected, and scanning continues until the
+quota is filled. If Gamma is exhausted, random rejects are reconsidered in
+discovery order so randomness cannot reduce the attainable final count. The
+result is `min(target, available nonredundant markets)` per category.
+
+Selected markets collect all API-served qualifying trades through the cohort's
+frozen creation time, rather than only the latest 90 days. Trade workers run while
+market discovery continues. Admission, semantic decisions, embeddings, cursors,
+and chosen markets are durable and reproducible. Markets with no qualifying
+trades remain part of the cohort.
 
 Embedding device `auto` tries NVIDIA CUDA, Apple Metal (`mps`, including M-series
 Macs), and CPU in that order. Accelerator failures fall back to the next device;
@@ -81,24 +89,26 @@ an explicit `cuda`, `mps`, or `cpu` selection is strict. Title vectors are cache
 in SQLite, so a resumed run does not need to recompute them. The local model is
 downloaded on its first use.
 
-Use `report --cohort balanced-90d` to inspect eligible, selected, redundant,
-fetched, failed, zero-trade, trade, event, and wallet counts by category. Passing
+Use `report --cohort balanced-lifetime` to inspect discovery progress, random
+rejections, eligible, selected, redundant, fetched, failed, zero-trade, trade,
+event, and wallet counts by category. Passing
 the same cohort to `export` additionally writes `cohort_markets.csv`,
 `cohort_trades.csv`, `cohort_similarity_rejections.csv`,
+`cohort_admission_rejections.csv`,
 `cohort_resolutions.csv`, `cohort_labels.csv`, and
 `cohort_label_fill_scenarios.csv`. Existing trades are not deleted and remain
 visible in the global report and exports.
 
 ## Automated resolved-market pipeline
 
-`run` is the default historical research workflow. It freezes the cohort window,
-discovers closed markets, verifies terminal resolutions before embedding or
-selection, selects the same balanced nonredundant sample, scans its trades,
+`run` is the default historical research workflow. It freezes the cohort cutoff,
+streams closed markets, verifies terminal resolutions before embedding or
+selection, selects the same balanced nonredundant lifetime sample, scans its trades,
 enriches the configured subset, and labels every qualifying cohort trade:
 
 ```shell
 python -m informed_flow --db data/informed_flow.sqlite3 run \
-  --cohort balanced-resolved-90d --days 90
+  --cohort balanced-resolved-lifetime
 ```
 
 Existing cohort names retain their original configuration. A cohort created by
@@ -106,6 +116,8 @@ Existing cohort names retain their original configuration. A cohort created by
 cohort; choose a new name. Missing, pending, canceled, ambiguous, and otherwise
 nonterminal resolutions are excluded before semantic selection. Finally settled
 disputed markets remain eligible, with their raw resolution evidence retained.
+Previously created bounded cohorts remain resumable with their original `--days`
+value; omit `--days` when creating a new lifetime cohort.
 
 The workflow uses a durable SQLite queue with unique jobs, renewable leases,
 eight attempts with exponential backoff, crash recovery, and two workers each
@@ -131,20 +143,21 @@ Live polling is opt-in:
 
 ```shell
 python -m informed_flow --db data/informed_flow.sqlite3 run \
-  --cohort balanced-resolved-90d --days 90 --live
+  --cohort balanced-resolved-lifetime --live
 ```
 
 Live delayed observations additionally retain top-of-book price, spread, depth,
 and average-fill scenarios for $100, $500, and $1,000. The system remains
 read-only and never submits an order.
 
-Backfills discover open and closed markets through Gamma keyset pagination, then
-fetch each market's Data API v2 trade history and enforce the requested timestamps
-locally. The global trade feed ignores date bounds and cannot serve a 90-day
-backfill. Coverage is limited to API-listed markets and available history, not a
-guarantee of every historical trade. Discovery scans all listed markets and can
-take a long time. Use `backfill --days 90 --max-markets 20` for a partial smoke test;
-the limit counts discovered markets, including excluded markets and empty markets.
+The legacy unstratified `backfill --days` command discovers open and closed markets
+through Gamma keyset pagination, then fetches each market's Data API v2 trade
+history and enforces timestamps locally. The global trade feed ignores date bounds
+and cannot serve a 90-day backfill. Coverage is limited to API-listed markets and
+available history, not a guarantee of every historical trade. This legacy command
+scans all listed markets and can take a long time. Use
+`backfill --days 90 --max-markets 20` for a partial smoke test; the limit counts
+discovered markets, including excluded markets and empty markets.
 
 The date window is frozen on first run. Discovery and per-market page checkpoints
 resume interrupted scans; duplicate trades are ignored. A completed scan retains

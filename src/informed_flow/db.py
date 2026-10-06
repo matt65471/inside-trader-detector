@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -314,6 +314,10 @@ CREATE TABLE IF NOT EXISTS backfill_cohorts (
     requested_device TEXT NOT NULL,
     effective_device TEXT,
     embedding_device_log TEXT,
+    history_mode TEXT NOT NULL DEFAULT 'bounded_days',
+    admission_rate_ppm INTEGER NOT NULL DEFAULT 1000000,
+    discovery_pages INTEGER NOT NULL DEFAULT 0,
+    discovery_stop_reason TEXT,
     resolution_required INTEGER NOT NULL DEFAULT 0 CHECK (resolution_required IN (0,1)),
     resolution_status TEXT NOT NULL DEFAULT 'not_required',
     phase TEXT NOT NULL CHECK (
@@ -340,6 +344,8 @@ CREATE TABLE IF NOT EXISTS backfill_cohort_markets (
     eligible INTEGER NOT NULL CHECK (eligible IN (0,1)),
     eligibility_reason TEXT,
     random_rank TEXT,
+    discovery_ordinal INTEGER,
+    admission_passed INTEGER CHECK (admission_passed IN (0,1)),
     embedding_text_hash TEXT,
     selection_status TEXT NOT NULL CHECK (
         selection_status IN ('candidate','selected','redundant','not_selected','not_target','ineligible','excluded')
@@ -486,6 +492,24 @@ class Database:
             self._ensure_column(
                 "backfill_cohorts", "resolution_status",
                 "TEXT NOT NULL DEFAULT 'not_required'",
+            )
+            for name, declaration in (
+                ("history_mode", "TEXT NOT NULL DEFAULT 'bounded_days'"),
+                ("admission_rate_ppm", "INTEGER NOT NULL DEFAULT 1000000"),
+                ("discovery_pages", "INTEGER NOT NULL DEFAULT 0"),
+                ("discovery_stop_reason", "TEXT"),
+            ):
+                self._ensure_column("backfill_cohorts", name, declaration)
+            for name, declaration in (
+                ("discovery_ordinal", "INTEGER"),
+                ("admission_passed", "INTEGER CHECK (admission_passed IN (0,1))"),
+            ):
+                self._ensure_column("backfill_cohort_markets", name, declaration)
+            self.connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_cohort_markets_stream
+                   ON backfill_cohort_markets(
+                       cohort_name,canonical_category,selection_status,discovery_ordinal
+                   )"""
             )
             for name, declaration in (
                 ("status", "TEXT NOT NULL DEFAULT 'pending'"),

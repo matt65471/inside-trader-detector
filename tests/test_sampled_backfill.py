@@ -261,6 +261,96 @@ class SampledBackfillTests(unittest.TestCase):
         self.assertEqual(categories["old"][2], "ended_before_window")
         self.assertEqual(categories["future"][2], "created_after_window")
 
+    def test_lifetime_streaming_stops_as_soon_as_every_category_is_full(self):
+        rows = [
+            sampled_market(
+                f"condition-{index}", f"Unique question {index}", category, f"event-{index}",
+            )
+            for index, category in enumerate(
+                ("Sports", "Crypto", "Weather", "Culture", "Finance", "World", "Elections")
+            )
+        ]
+        api = SampleAPI([])
+        api.discovery_pages = [Page(rows, "unused-next-page"), Page([], None)]
+        vectors = {
+            normalize_title(row["question"]): [float(position == index) for position in range(7)]
+            for index, row in enumerate(rows)
+        }
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 10_000_000),
+            SampledBackfillConfig(
+                "lifetime-stop", days=None, markets_per_category=1, admission_rate=1.0,
+            ),
+            clock=lambda: 10_000_000, embedder=FakeEmbedder(vectors),
+        )
+        runner.stream_select()
+        self.assertEqual(api.market_requests, [(None, True)])
+        cohort = self.db.row("SELECT * FROM backfill_cohorts")
+        self.assertEqual(cohort["history_mode"], "lifetime")
+        self.assertEqual(cohort["window_start"], 1)
+        self.assertEqual(cohort["discovery_stop_reason"], "quotas_filled")
+        self.assertEqual(
+            self.db.row(
+                "SELECT COUNT(*) n FROM backfill_cohort_markets WHERE selection_status='selected'"
+            )["n"],
+            7,
+        )
+
+    def test_lifetime_exhaustion_reconsiders_random_rejects_and_semantic_duplicates(self):
+        rows = [
+            sampled_market("one", "Will Alpha happen?", "Finance", "event-one"),
+            sampled_market("duplicate", "Does Alpha happen?", "Finance", "event-two"),
+            sampled_market("two", "Will rates fall?", "Finance", "event-three"),
+        ]
+        vectors = {
+            normalize_title(rows[0]["question"]): [1.0, 0.0],
+            normalize_title(rows[1]["question"]): [1.0, 0.0],
+            normalize_title(rows[2]["question"]): [0.0, 1.0],
+        }
+        api = SampleAPI(rows)
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 10_000_000),
+            SampledBackfillConfig(
+                "fallback", days=None, markets_per_category=2,
+                admission_rate=0.000000001,
+            ),
+            clock=lambda: 10_000_000, embedder=FakeEmbedder(vectors),
+        )
+        runner.stream_select()
+        statuses = {
+            row["selection_status"]: row["n"] for row in self.db.rows(
+                "SELECT selection_status,COUNT(*) n FROM backfill_cohort_markets GROUP BY selection_status"
+            )
+        }
+        self.assertEqual(statuses, {"redundant": 1, "selected": 2})
+        self.assertEqual(
+            self.db.row("SELECT discovery_stop_reason FROM backfill_cohorts")[0],
+            "gamma_exhausted",
+        )
+
+    def test_lifetime_fetch_keeps_trades_older_than_ninety_days(self):
+        raw_market = sampled_market(
+            "old-market", "Will the old event resolve?", "Elections", "old-event",
+        )
+        old_trade = trade(
+            "old-trade", condition="old-market", asset="asset-old", timestamp=100,
+            title=raw_market["question"], slug="old-market",
+        )
+        api = SampleAPI([raw_market], {"old-market": [old_trade]})
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 10_000_000),
+            SampledBackfillConfig(
+                "lifetime-trades", days=None, markets_per_category=1, admission_rate=1.0,
+            ),
+            clock=lambda: 10_000_000,
+            embedder=FakeEmbedder({normalize_title(raw_market["question"]): [1.0, 0.0]}),
+        )
+        self.assertEqual(runner.run(), 0)
+        self.assertEqual(self.db.row("SELECT COUNT(*) n FROM trades")["n"], 1)
+        self.assertEqual(
+            self.db.row("SELECT qualifying_trade_count FROM backfill_cohort_markets")[0], 1,
+        )
+
 
 class Availability:
     def __init__(self, available: bool):

@@ -216,14 +216,25 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
         if not selected:
             raise ValueError(f"Unknown cohort: {cohort}")
         print(f"Sampled cohort {cohort}")
-        print(
-            f"  phase={selected['phase']} window="
-            f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_start']))} to "
-            f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_end']))}"
-        )
+        if selected["history_mode"] == "lifetime":
+            print(
+                f"  phase={selected['phase']} history=lifetime through "
+                f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_end']))}"
+            )
+        else:
+            print(
+                f"  phase={selected['phase']} window="
+                f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_start']))} to "
+                f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(selected['window_end']))}"
+            )
         print(
             f"  target/category={selected['category_limit']} seed={selected['seed']} "
+            f"admission={selected['admission_rate_ppm'] / 10000:.2f}% "
             f"device={selected['effective_device'] or selected['requested_device']}"
+        )
+        print(
+            f"  discovery pages={selected['discovery_pages']} "
+            f"stop={selected['discovery_stop_reason'] or 'in_progress'}"
         )
         if selected["last_error"]:
             print(f"  last note/error: {selected['last_error']}")
@@ -239,6 +250,8 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
                        COALESCE(SUM(eligible),0) eligible,
                        COALESCE(SUM(selection_status='selected'),0) selected,
                        COALESCE(SUM(selection_status='redundant'),0) redundant,
+                       COALESCE(SUM(selection_status='not_selected'
+                                    AND selection_reason='random_reject'),0) random_rejected,
                        COALESCE(SUM(selection_status='selected' AND fetch_status='complete'),0) fetched,
                        COALESCE(SUM(selection_status='selected' AND fetch_status='failed'),0) failed,
                        COALESCE(SUM(selection_status='selected' AND fetch_status='complete'
@@ -262,7 +275,9 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
             )["n"]
             print(
                 f"  {category}: eligible={row['eligible']} selected={row['selected']} "
-                f"redundant={row['redundant']} fetched={row['fetched']} failed={row['failed']} "
+                f"shortfall={max(0, selected['category_limit'] - row['selected'])} "
+                f"redundant={row['redundant']} random_rejected={row['random_rejected']} "
+                f"fetched={row['fetched']} failed={row['failed']} "
                 f"zero_trade={row['zero_trade']} trades={row['trades']} "
                 f"events={row['unique_events']} wallets={wallets}"
             )
@@ -439,6 +454,16 @@ def _export(db: Database, output: Path, cohort: str | None = None) -> None:
                ORDER BY canonical_category,random_rank""",
             (cohort,),
         )
+        _export_query(
+            db, output, "cohort_admission_rejections.csv",
+            """SELECT cohort_name,condition_id,title,canonical_category,random_rank,
+                      discovery_ordinal,selection_reason
+               FROM backfill_cohort_markets
+               WHERE cohort_name=? AND selection_status='not_selected'
+                 AND selection_reason='random_reject'
+               ORDER BY discovery_ordinal,condition_id""",
+            (cohort,),
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -458,19 +483,28 @@ def build_parser() -> argparse.ArgumentParser:
         "sampled-backfill", help="Backfill a balanced, semantically deduplicated closed-market cohort"
     )
     sampled.add_argument("--cohort", required=True)
-    sampled.add_argument("--days", type=int, default=90)
+    sampled.add_argument(
+        "--days", type=int, default=None,
+        help="Legacy bounded cohort window; omit for lifetime streaming selection",
+    )
     sampled.add_argument("--markets-per-category", type=int, default=1000)
     sampled.add_argument("--seed", type=int, default=0)
+    sampled.add_argument("--admission-rate", type=float, default=0.50)
     sampled.add_argument("--similarity-threshold", type=float, default=0.90)
     sampled.add_argument("--embedding-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
+    sampled.add_argument("--market-workers", type=int, default=2)
 
     run = subparsers.add_parser(
         "run", help="Run the automated resolved historical cohort pipeline"
     )
     run.add_argument("--cohort", required=True)
-    run.add_argument("--days", type=int, default=90)
+    run.add_argument(
+        "--days", type=int, default=None,
+        help="Legacy bounded cohort window; omit for lifetime streaming selection",
+    )
     run.add_argument("--markets-per-category", type=int, default=1000)
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--admission-rate", type=float, default=0.50)
     run.add_argument("--similarity-threshold", type=float, default=0.90)
     run.add_argument("--embedding-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     run.add_argument("--market-workers", type=int, default=2)
@@ -503,7 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if getattr(args, "days", 1) <= 0:
+    if getattr(args, "days", None) is not None and args.days <= 0:
         parser.error("--days must be positive")
     if getattr(args, "interval", 1) <= 0:
         parser.error("--interval must be positive")
@@ -515,6 +549,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--markets-per-category must be positive")
     if not 0 < getattr(args, "similarity_threshold", 0.90) <= 1:
         parser.error("--similarity-threshold must be greater than 0 and at most 1")
+    if not 0 < getattr(args, "admission_rate", 0.50) <= 1:
+        parser.error("--admission-rate must be greater than 0 and at most 1")
     for field in ("market_workers", "enrichment_workers", "resolution_workers", "label_workers"):
         if getattr(args, field, 1) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
@@ -557,6 +593,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     days=args.days,
                     markets_per_category=args.markets_per_category,
                     seed=args.seed,
+                    admission_rate=args.admission_rate,
                     similarity_threshold=args.similarity_threshold,
                     embedding_device=args.embedding_device,
                     resolution_required=True,
@@ -573,17 +610,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "backfill":
             return _backfill(collector, db, args.days, args.max_markets)
         if args.command == "sampled-backfill":
-            return SampledBackfill(
-                db,
-                collector,
+            db.close()
+            return AutomatedPipeline(
+                args.db,
                 SampledBackfillConfig(
                     cohort=args.cohort,
                     days=args.days,
                     markets_per_category=args.markets_per_category,
                     seed=args.seed,
+                    admission_rate=args.admission_rate,
                     similarity_threshold=args.similarity_threshold,
                     embedding_device=args.embedding_device,
                 ),
+                market_workers=args.market_workers,
+                enrichment_workers=0,
+                resolution_workers=0,
+                label_workers=0,
+                downstream=False,
             ).run()
         if args.command == "watch":
             return _watch(collector, db, once=args.once, interval=args.interval)

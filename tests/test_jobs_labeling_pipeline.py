@@ -221,6 +221,70 @@ class PipelineAPI(SampleAPI):
 
 
 class AutomatedPipelineTests(unittest.TestCase):
+    def test_sampling_only_pipeline_streams_without_downstream_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sampling-only.sqlite3"
+            raw_market = sampled_market(
+                "condition-sample", "Will the sample happen?", "Elections", "event-sample",
+            )
+            raw_trade = trade(
+                "sample-trade", condition="condition-sample", asset="asset-sample",
+                timestamp=2_000_000, title=raw_market["question"], slug="condition-sample",
+            )
+            api = PipelineAPI(raw_market, raw_trade)
+            config = SampledBackfillConfig(
+                "sampling-only", days=None, markets_per_category=1, admission_rate=1.0,
+            )
+            pipeline = AutomatedPipeline(
+                path, config, market_workers=2, enrichment_workers=0,
+                resolution_workers=0, label_workers=0, downstream=False,
+                clock=lambda: 2_000_100, api_factory=lambda: api,
+                embedder=FakeEmbedder({normalize_title(raw_market["question"]): [1.0, 0.0]}),
+            )
+            self.assertEqual(pipeline.run(), 0)
+            db = Database(path)
+            db.initialize()
+            self.assertEqual(db.row("SELECT phase FROM backfill_cohorts")[0], "complete")
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM trades")["n"], 1)
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM labels")["n"], 0)
+            self.assertEqual(
+                db.row("SELECT COUNT(*) n FROM jobs WHERE job_kind!='scan_market'")["n"], 0,
+            )
+            self.assertEqual(api.trade_requests, ["condition-sample"])
+            db.close()
+
+    def test_lifetime_pipeline_selects_resolves_and_scans_while_streaming(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lifetime-pipeline.sqlite3"
+            raw_market = sampled_market(
+                "condition-lifetime", "Will Company report results?", "Business", "event-life",
+            )
+            raw_trade = trade(
+                "lifetime-trade", condition="condition-lifetime",
+                asset="asset-lifetime", timestamp=2_000_000,
+                title=raw_market["question"], slug="condition-lifetime",
+            )
+            api = PipelineAPI(raw_market, raw_trade)
+            config = SampledBackfillConfig(
+                "lifetime-resolved", days=None, markets_per_category=1,
+                admission_rate=1.0, resolution_required=True,
+            )
+            pipeline = AutomatedPipeline(
+                path, config, market_workers=2, enrichment_workers=1,
+                resolution_workers=2, label_workers=1, clock=lambda: 2_000_100,
+                api_factory=lambda: api,
+                embedder=FakeEmbedder({normalize_title(raw_market["question"]): [1.0, 0.0]}),
+            )
+            self.assertEqual(pipeline.run(), 0)
+            db = Database(path)
+            db.initialize()
+            cohort = db.row("SELECT * FROM backfill_cohorts")
+            self.assertEqual((cohort["history_mode"], cohort["window_start"]), ("lifetime", 1))
+            self.assertEqual(cohort["discovery_stop_reason"], "gamma_exhausted")
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM trades")["n"], 1)
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM labels")["n"], 3)
+            db.close()
+
     def test_resolution_jobs_are_batched_at_twenty_conditions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "batches.sqlite3"
@@ -332,6 +396,9 @@ class MigrationTests(unittest.TestCase):
             label_columns = {row["name"] for row in db.rows("PRAGMA table_info(labels)")}
             cohort_columns = {row["name"] for row in db.rows("PRAGMA table_info(backfill_cohorts)")}
             self.assertTrue({"status", "gross_pnl_microusd", "source_json", "spread_ppm"} <= label_columns)
-            self.assertTrue({"resolution_required", "resolution_status"} <= cohort_columns)
+            self.assertTrue({
+                "resolution_required", "resolution_status", "history_mode",
+                "admission_rate_ppm", "discovery_pages", "discovery_stop_reason",
+            } <= cohort_columns)
             self.assertIsNotNone(db.row("SELECT 1 FROM sqlite_master WHERE name='jobs'"))
             db.close()

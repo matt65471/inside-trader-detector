@@ -1,6 +1,7 @@
 """Automated resolved-cohort collection, enrichment, labeling, and optional live mode."""
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import sqlite3
@@ -35,6 +36,7 @@ class AutomatedPipeline:
         clock: Callable[[], float] = time.time,
         api_factory: Callable[[], PolymarketAPI] = PolymarketAPI,
         embedder: BatchEmbedder | None = None,
+        downstream: bool = True,
     ):
         self.db_path = Path(db_path)
         self.config = config
@@ -47,6 +49,7 @@ class AutomatedPipeline:
         self.clock = clock
         self.api_factory = api_factory
         self.embedder = embedder
+        self.downstream = downstream
         self.stopping = threading.Event()
 
     def _db(self) -> Database:
@@ -136,22 +139,34 @@ class AutomatedPipeline:
                 thread.join(timeout=5)
         return self._dead(db, self.config.cohort, kinds)
 
-    def _enqueue_resolution_verification(self, db: Database) -> None:
+    def _enqueue_resolution_verification(
+        self, db: Database, conditions: Iterable[str] | None = None,
+    ) -> None:
         queue = JobQueue(db, clock=self.clock)
-        rows = db.rows(
-            """SELECT condition_id FROM backfill_cohort_markets cm
-               WHERE cohort_name=? AND eligible=1
-                 AND NOT EXISTS (SELECT 1 FROM market_resolutions mr
-                                 WHERE mr.condition_id=cm.condition_id AND mr.terminal=1)
-               ORDER BY condition_id""",
-            (self.config.cohort,),
-        )
-        conditions = [row["condition_id"] for row in rows]
-        for offset in range(0, len(conditions), 20):
-            batch = conditions[offset:offset + 20]
+        if conditions is None:
+            rows = db.rows(
+                """SELECT condition_id FROM backfill_cohort_markets cm
+                   WHERE cohort_name=? AND eligible=1
+                     AND NOT EXISTS (SELECT 1 FROM market_resolutions mr
+                                     WHERE mr.condition_id=cm.condition_id AND mr.terminal=1)
+                   ORDER BY condition_id""",
+                (self.config.cohort,),
+            )
+            pending = [row["condition_id"] for row in rows]
+        else:
+            pending = [
+                condition for condition in conditions
+                if not (db.row(
+                    "SELECT terminal FROM market_resolutions WHERE condition_id=?",
+                    (condition,),
+                ) or {"terminal": 0})["terminal"]
+            ]
+        for offset in range(0, len(pending), 20):
+            batch = pending[offset:offset + 20]
+            digest = hashlib.sha256("\0".join(batch).encode("utf-8")).hexdigest()[:20]
             queue.enqueue(
                 "verify_resolution",
-                f"verify_resolution:{self.config.cohort}:{offset // 20}",
+                f"verify_resolution:{self.config.cohort}:{digest}",
                 {"conditions": batch}, cohort=self.config.cohort,
                 entity_id=",".join(batch), priority=20,
             )
@@ -172,17 +187,25 @@ class AutomatedPipeline:
                  AND fetch_status IN ('pending','failed')""",
             (self.config.cohort,),
         ):
-            condition = row["condition_id"]
-            queue.enqueue(
-                "scan_market", f"scan_market:{self.config.cohort}:{condition}",
-                {
-                    "condition_id": condition,
-                    "window_start": cohort["window_start"],
-                    "window_end": cohort["window_end"],
-                },
-                cohort=self.config.cohort, entity_id=condition, priority=10,
-                reopen_succeeded=True,
-            )
+            self._enqueue_scan(db, row["condition_id"], cohort=cohort, queue=queue)
+
+    def _enqueue_scan(
+        self, db: Database, condition: str, *,
+        cohort: Mapping[str, Any] | None = None, queue: JobQueue | None = None,
+    ) -> None:
+        cohort = cohort or db.row(
+            "SELECT * FROM backfill_cohorts WHERE cohort_name=?", (self.config.cohort,),
+        )
+        queue = queue or JobQueue(db, clock=self.clock)
+        queue.enqueue(
+            "scan_market", f"scan_market:{self.config.cohort}:{condition}",
+            {
+                "condition_id": condition,
+                "window_start": cohort["window_start"],
+                "window_end": cohort["window_end"],
+            },
+            cohort=self.config.cohort, entity_id=condition, priority=10,
+        )
 
     def _needs_enrichment(self, db: Database, trade_key: str) -> bool:
         row = db.row(
@@ -303,7 +326,10 @@ class AutomatedPipeline:
         saved = db.checkpoint(checkpoint)
         collector = Collector(
             db, api, clock=self.clock, capture_books_inline=False,
-            on_trade_stored=self._atomic_trade_jobs(self.config.cohort, live=False),
+            on_trade_stored=(
+                self._atomic_trade_jobs(self.config.cohort, live=False)
+                if self.downstream else None
+            ),
         )
         counts = collector.collect_window(
             start=int(job.payload["window_start"]), end=int(job.payload["window_end"]),
@@ -332,7 +358,8 @@ class AutomatedPipeline:
                    WHERE cohort_name=? AND condition_id=?""",
                 (count, self.config.cohort, condition),
             )
-        self._enqueue_trade_jobs(db, self.config.cohort, condition=condition)
+        if self.downstream:
+            self._enqueue_trade_jobs(db, self.config.cohort, condition=condition)
 
     def _enrich_handler(
         self, db: Database, api: PolymarketAPI, _queue: JobQueue, job: Job, _worker: str,
@@ -397,6 +424,64 @@ class AutomatedPipeline:
                 thread.join(timeout=5)
         return self._dead(db, self.config.cohort, ("scan_market", "enrich_trade", "observe_entry"))
 
+    def _streaming_historical_workers(
+        self, db: Database, sampled: SampledBackfill,
+    ) -> int:
+        """Run scan/downstream consumers while the main thread produces selections."""
+        # Reconstruct durable work before consumers start so reconciliation cannot
+        # race a worker that is committing the same job's successful result.
+        self._enqueue_scans(db)
+        if self.downstream:
+            self._enqueue_trade_jobs(db, self.config.cohort)
+        done = threading.Event()
+        specs = [(("scan_market",), self.market_workers, self._scan_handler, "market")]
+        if self.downstream:
+            specs.extend([
+                (("enrich_trade",), self.enrichment_workers, self._enrich_handler, "enrich"),
+                (("observe_entry",), self.label_workers, self._label_handler, "label"),
+            ])
+        threads: list[threading.Thread] = []
+        for kinds, count, handler, prefix in specs:
+            for index in range(count):
+                thread = threading.Thread(
+                    target=self._worker,
+                    args=(kinds, handler, done, f"{prefix}-{index}"),
+                    kwargs={"claim_cohort": self.config.cohort}, daemon=True,
+                )
+                threads.append(thread)
+                thread.start()
+
+        def prepare(conditions: list[str]) -> None:
+            if not self.config.resolution_required or not conditions:
+                return
+            sampled._update_cohort(resolution_status="running")
+            self._enqueue_resolution_verification(db, conditions)
+            if self._run_group(
+                db, ("verify_resolution",), self.resolution_workers, self._verify_handler,
+            ):
+                sampled._update_cohort(
+                    resolution_status="failed", last_error="resolution jobs failed",
+                )
+                raise RuntimeError("One or more resolution jobs failed")
+
+        try:
+            sampled.stream_select(
+                prepare_candidates=prepare if self.config.resolution_required else None,
+                on_selected=lambda condition: self._enqueue_scan(db, condition),
+            )
+            required = ("scan_market", "enrich_trade", "observe_entry") if self.downstream else (
+                "scan_market",
+            )
+            while not self.stopping.is_set() and self._job_remaining(
+                db, self.config.cohort, required,
+            ):
+                time.sleep(0.05)
+            return self._dead(db, self.config.cohort, required)
+        finally:
+            done.set()
+            for thread in threads:
+                thread.join(timeout=5)
+
     def _poll_live_handler(
         self, db: Database, api: PolymarketAPI, _queue: JobQueue, job: Job, _worker: str,
     ) -> None:
@@ -460,9 +545,21 @@ class AutomatedPipeline:
                 db, collector, self.config, clock=self.clock, embedder=self.embedder,
             )
             cohort = sampled._cohort()
+            if cohort["history_mode"] == "lifetime":
+                if self._streaming_historical_workers(db, sampled):
+                    sampled._update_cohort(
+                        phase="fetching", last_error="one or more pipeline jobs are dead",
+                    )
+                    return 1
+                sampled._update_cohort(phase="complete", last_error=None)
+                label = "Automated historical cohort" if self.downstream else "Sampled backfill cohort"
+                print(f"{label} {self.config.cohort} is complete", flush=True)
+                if self.live and self.downstream and not self.stopping.is_set():
+                    return self._run_live(db)
+                return 130 if self.stopping.is_set() else 0
             sampled.discover(cohort)
             cohort = sampled._cohort()
-            if cohort["resolution_status"] != "complete":
+            if self.config.resolution_required and cohort["resolution_status"] != "complete":
                 sampled._update_cohort(resolution_status="running")
                 self._enqueue_resolution_verification(db)
                 if self._run_group(
@@ -476,8 +573,14 @@ class AutomatedPipeline:
                 sampled.ensure_embeddings()
             sampled.select()
             self._enqueue_scans(db)
-            self._enqueue_trade_jobs(db, self.config.cohort)
-            if self._historical_workers(db):
+            if self.downstream:
+                self._enqueue_trade_jobs(db, self.config.cohort)
+            dead = (
+                self._historical_workers(db)
+                if self.downstream else
+                self._run_group(db, ("scan_market",), self.market_workers, self._scan_handler)
+            )
+            if dead:
                 sampled._update_cohort(phase="fetching", last_error="one or more pipeline jobs are dead")
                 return 1
             sampled._update_cohort(phase="complete", last_error=None)
