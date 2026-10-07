@@ -202,7 +202,7 @@ class AutomatedPipeline:
             self.config.cohort, list(job.payload["conditions"]),
         )
 
-    def _enqueue_scans(self, db: Database) -> None:
+    def _enqueue_scans(self, db: Database, *, reopen_succeeded: bool = False) -> None:
         cohort = db.row("SELECT * FROM backfill_cohorts WHERE cohort_name=?", (self.config.cohort,))
         queue = JobQueue(db, clock=self.clock)
         for row in db.rows(
@@ -211,11 +211,15 @@ class AutomatedPipeline:
                  AND fetch_status IN ('pending','failed')""",
             (self.config.cohort,),
         ):
-            self._enqueue_scan(db, row["condition_id"], cohort=cohort, queue=queue)
+            self._enqueue_scan(
+                db, row["condition_id"], cohort=cohort, queue=queue,
+                reopen_succeeded=reopen_succeeded,
+            )
 
     def _enqueue_scan(
         self, db: Database, condition: str, *,
         cohort: Mapping[str, Any] | None = None, queue: JobQueue | None = None,
+        reopen_succeeded: bool = False,
     ) -> None:
         cohort = cohort or db.row(
             "SELECT * FROM backfill_cohorts WHERE cohort_name=?", (self.config.cohort,),
@@ -229,6 +233,7 @@ class AutomatedPipeline:
                 "window_end": cohort["window_end"],
             },
             cohort=self.config.cohort, entity_id=condition, priority=10,
+            reopen_succeeded=reopen_succeeded,
         )
 
     def _needs_enrichment(self, db: Database, trade_key: str) -> bool:
@@ -501,9 +506,18 @@ class AutomatedPipeline:
                 return
             sampled._update_cohort(resolution_status="running")
             self._enqueue_resolution_verification(db, conditions)
-            if self._run_group(
+            resolution_dead = self._run_group(
                 db, ("verify_resolution",), self.resolution_workers, self._verify_handler,
-            ):
+            )
+            if self.stopping.is_set():
+                with db.connection:
+                    db.connection.execute(
+                        """UPDATE backfill_cohorts SET last_error='interrupted',updated_at=?
+                           WHERE cohort_name=?""",
+                        (int(self.clock()), self.config.cohort),
+                    )
+                return 130
+            if resolution_dead:
                 sampled._update_cohort(
                     resolution_status="failed", last_error="resolution jobs failed",
                 )
@@ -578,6 +592,104 @@ class AutomatedPipeline:
             for thread in threads:
                 thread.join(timeout=5)
         return 130
+
+    def finish_existing(self) -> int:
+        """Freeze current selection and finish only its existing historical work."""
+        db = self._db()
+        previous = signal.signal(signal.SIGINT, lambda *_: self.stopping.set())
+        try:
+            cohort = db.row(
+                "SELECT * FROM backfill_cohorts WHERE cohort_name=?", (self.config.cohort,),
+            )
+            if not cohort:
+                print(f"Unknown cohort: {self.config.cohort}", file=sys.stderr)
+                return 1
+            with db.connection:
+                db.connection.execute(
+                    """UPDATE backfill_cohorts
+                       SET discovery_complete=1,
+                           discovery_stop_reason=COALESCE(discovery_stop_reason,'finish_existing'),
+                           phase='fetching',last_error=NULL,updated_at=?
+                       WHERE cohort_name=?""",
+                    (int(self.clock()), self.config.cohort),
+                )
+            JobQueue(db, clock=self.clock).recover_expired(self.config.cohort)
+
+            selected = [
+                row["condition_id"] for row in db.rows(
+                    """SELECT condition_id FROM backfill_cohort_markets
+                       WHERE cohort_name=? AND selection_status='selected'
+                       ORDER BY condition_id""",
+                    (self.config.cohort,),
+                )
+            ]
+            self._enqueue_resolution_verification(db, selected)
+            if self._run_group(
+                db, ("verify_resolution",), self.resolution_workers, self._verify_handler,
+            ):
+                with db.connection:
+                    db.connection.execute(
+                        """UPDATE backfill_cohorts SET resolution_status='failed',last_error=?,updated_at=?
+                           WHERE cohort_name=?""",
+                        ("resolution jobs failed", int(self.clock()), self.config.cohort),
+                    )
+                return 1
+            with db.connection:
+                db.connection.execute(
+                    """UPDATE backfill_cohorts SET resolution_status='complete',updated_at=?
+                       WHERE cohort_name=?""",
+                    (int(self.clock()), self.config.cohort),
+                )
+
+            self._enqueue_scans(db, reopen_succeeded=True)
+            self._enqueue_trade_jobs(db, self.config.cohort)
+            dead = self._historical_workers(db)
+            if self.stopping.is_set():
+                with db.connection:
+                    db.connection.execute(
+                        """UPDATE backfill_cohorts
+                           SET phase='fetching',last_error='interrupted',updated_at=?
+                           WHERE cohort_name=?""",
+                        (int(self.clock()), self.config.cohort),
+                    )
+                return 130
+            if dead:
+                with db.connection:
+                    db.connection.execute(
+                        """UPDATE backfill_cohorts SET phase='fetching',last_error=?,updated_at=?
+                           WHERE cohort_name=?""",
+                        ("one or more pipeline jobs are dead", int(self.clock()), self.config.cohort),
+                    )
+                return 1
+            with db.connection:
+                db.connection.execute(
+                    """UPDATE backfill_cohorts SET phase='complete',last_error=NULL,updated_at=?
+                       WHERE cohort_name=?""",
+                    (int(self.clock()), self.config.cohort),
+                )
+            print(
+                f"Existing markets for cohort {self.config.cohort} are complete",
+                flush=True,
+            )
+            return 130 if self.stopping.is_set() else 0
+        except KeyboardInterrupt:
+            self.stopping.set()
+            return 130
+        except (APIError, RuntimeError, ValueError) as exc:
+            try:
+                with db.connection:
+                    db.connection.execute(
+                        """UPDATE backfill_cohorts SET last_error=?,updated_at=?
+                           WHERE cohort_name=?""",
+                        (str(exc), int(self.clock()), self.config.cohort),
+                    )
+            except sqlite3.Error:
+                pass
+            print(f"Finish-existing pipeline stopped: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            signal.signal(signal.SIGINT, previous)
+            db.close()
 
     def run(self) -> int:
         db = self._db()

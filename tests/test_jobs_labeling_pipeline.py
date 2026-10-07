@@ -234,6 +234,55 @@ class PipelineAPI(SampleAPI):
 
 
 class AutomatedPipelineTests(unittest.TestCase):
+    def test_finish_existing_freezes_selection_without_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "finish-existing.sqlite3"
+            raw_market = sampled_market(
+                "condition-existing", "Will existing result happen?", "Business", "event-existing",
+            )
+            raw_trade = trade(
+                "existing-trade", condition="condition-existing", asset="asset-existing",
+                timestamp=2_000_000, title=raw_market["question"], slug="condition-existing",
+            )
+            api = PipelineAPI(raw_market, raw_trade)
+            config = SampledBackfillConfig(
+                "finish-existing", days=None, markets_per_category=10,
+                resolution_required=True,
+            )
+            db = Database(path)
+            db.initialize()
+            sampled = SampledBackfill(
+                db, Collector(db, api, clock=lambda: 2_000_100), config,
+                clock=lambda: 2_000_100, embedder=FakeEmbedder({}),
+            )
+            sampled._cohort()
+            sampled._discover_market(raw_market, 1, 2_000_100, 1)
+            with db.connection:
+                db.connection.execute(
+                    """UPDATE backfill_cohort_markets
+                       SET selection_status='selected',fetch_status='pending'
+                       WHERE cohort_name=? AND condition_id=?""",
+                    (config.cohort, "condition-existing"),
+                )
+            requests_before = len(api.market_requests)
+            db.close()
+
+            pipeline = AutomatedPipeline(
+                path, config, market_workers=1, enrichment_workers=1,
+                resolution_workers=1, label_workers=1, clock=lambda: 2_000_100,
+                api_factory=lambda: api,
+            )
+            self.assertEqual(pipeline.finish_existing(), 0)
+            self.assertEqual(len(api.market_requests), requests_before)
+            db = Database(path)
+            db.initialize()
+            cohort = db.row("SELECT * FROM backfill_cohorts WHERE cohort_name='finish-existing'")
+            self.assertEqual((cohort["discovery_complete"], cohort["phase"]), (1, "complete"))
+            self.assertEqual(cohort["discovery_stop_reason"], "finish_existing")
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM trades")["n"], 1)
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM labels")["n"], 3)
+            db.close()
+
     def test_http_500_market_is_skipped_without_stopping_other_market_scans(self) -> None:
         class OneBrokenMarketAPI(SampleAPI):
             def trades_page(self, **kwargs):

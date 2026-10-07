@@ -89,6 +89,15 @@ section for the current status, while retaining that document's research scope.
   concurrently with continued discovery, enriches the selected subset, and labels
   every qualifying cohort trade at +15 minutes, +1 hour, and +24 hours. Live polling
   remains opt-in through `--live`.
+- `finish-existing --cohort NAME` permanently freezes the cohort's current selection
+  and performs no further discovery or selection. It verifies the selected markets,
+  resumes their incomplete scans, and reconciles enrichment and historical label jobs.
+- Exhausted HTTP 500 responses must not stop a historical cohort. During discovery,
+  mark only the failing Gamma tag stream exhausted, retain its `last_error`, and
+  continue other tag feeds. For queued historical resolution, scan, enrichment, and
+  labeling work, retain the entity's failed/incomplete state and terminate that job
+  as an audited skip so other jobs continue. Do not apply permanent-skip behavior to
+  live polling, where it could silently disable the only poller.
 - The SQLite queue uses unique job keys, leases, crash recovery, eight attempts,
   exponential backoff, and dead-letter reporting. Trade insertion atomically adds
   downstream work, while startup reconciliation repairs missing jobs from
@@ -103,7 +112,7 @@ section for the current status, while retaining that document's research scope.
   training, profitability claims, and paper trading are **not implemented**. Do not
   train a model to reproduce the heuristic score.
 - The summary-only, tag-filtered streaming sampled-backfill, queue, resolution, and
-  labeling implementation was verified with 71 local tests. Update the validation record
+  labeling implementation was verified with 72 local tests. Update the validation record
   when subsequent code changes introduce new checks.
 
 ## Checkout and database locations

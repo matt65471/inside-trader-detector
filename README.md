@@ -47,6 +47,7 @@ python -m informed_flow init
 python -m informed_flow backfill --days 90
 python -m informed_flow sampled-backfill --cohort balanced-lifetime
 python -m informed_flow run --cohort balanced-resolved-lifetime
+python -m informed_flow finish-existing --cohort balanced-resolved-lifetime
 python -m informed_flow watch --once
 python -m informed_flow watch --interval 60
 python -m informed_flow enrich
@@ -138,6 +139,35 @@ The command exits only after required historical jobs are terminal and returns
 nonzero when a required job is dead. Inspect queue and label coverage with
 `report --cohort balanced-resolved-90d`; after correcting a persistent failure,
 use `retry-jobs` to return dead work to the queue.
+
+To stop discovery permanently for a cohort and finish only its already-selected
+markets, stored trades, enrichment, and historical labels, run:
+
+```shell
+python -m informed_flow --db data/informed_flow.sqlite3 finish-existing \
+  --cohort balanced-resolved-lifetime
+```
+
+This freezes the current selection. It does not discover or select any additional
+markets. It verifies resolutions for the selected markets, resumes incomplete
+market scans, and reconciles enrichment and labeling jobs for stored trades.
+Re-running the command is safe: durable checkpoints and unique queue keys prevent
+completed work from being duplicated. Use the same absolute `--db` path and cohort
+name as the original run. Worker counts can be adjusted independently:
+
+```shell
+python -m informed_flow --db data/informed_flow.sqlite3 finish-existing \
+  --cohort balanced-resolved-lifetime \
+  --market-workers 4 --enrichment-workers 4 \
+  --resolution-workers 2 --label-workers 4
+```
+
+Historical HTTP 500 handling is scoped so one upstream failure cannot terminate the
+whole cohort. A Gamma 500 during discovery exhausts and records only that tag feed,
+then discovery continues with the remaining feeds. A 500 in queued resolution,
+market-scan, enrichment, or labeling work is retained as an audited incomplete/failed
+item while other jobs continue. Live polling continues retrying instead of being
+permanently skipped.
 
 Historical labels use +15 minute, +1 hour, and +24 hour targets. They take the
 earliest price-history observation at or after the target, never a pre-target

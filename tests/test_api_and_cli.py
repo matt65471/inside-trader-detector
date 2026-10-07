@@ -118,9 +118,11 @@ class CLITests(unittest.TestCase):
         parser = build_parser()
         sampled = parser.parse_args(["sampled-backfill", "--cohort", "sample"])
         automated = parser.parse_args(["run", "--cohort", "resolved"])
+        finish = parser.parse_args(["finish-existing", "--cohort", "resolved"])
         self.assertIsNone(sampled.days)
         self.assertIsNone(automated.days)
         self.assertEqual((sampled.admission_rate, automated.admission_rate), (0.5, 0.5))
+        self.assertEqual((finish.market_workers, finish.label_workers), (2, 2))
 
     def test_market_backfill_resumes_partial_run_with_frozen_window(self) -> None:
         class HistoricalAPI(FakeAPI):

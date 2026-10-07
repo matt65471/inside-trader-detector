@@ -528,6 +528,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--live", action="store_true")
     run.add_argument("--interval", type=int, default=60)
 
+    finish = subparsers.add_parser(
+        "finish-existing",
+        help="Freeze a cohort's current selection and finish scans, enrichment, and labels",
+    )
+    finish.add_argument("--cohort", required=True)
+    finish.add_argument("--market-workers", type=int, default=2)
+    finish.add_argument("--enrichment-workers", type=int, default=2)
+    finish.add_argument("--resolution-workers", type=int, default=2)
+    finish.add_argument("--label-workers", type=int, default=2)
+
     watch = subparsers.add_parser("watch", help="Watch new public trades")
     watch.add_argument("--once", action="store_true", help="Poll once and exit")
     watch.add_argument("--interval", type=int, default=60, help="Seconds between polls")
@@ -619,6 +629,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 live=args.live,
                 live_interval=args.interval,
             ).run()
+
+        if args.command == "finish-existing":
+            db.close()
+            return AutomatedPipeline(
+                args.db,
+                SampledBackfillConfig(cohort=args.cohort, resolution_required=True),
+                market_workers=args.market_workers,
+                enrichment_workers=args.enrichment_workers,
+                resolution_workers=args.resolution_workers,
+                label_workers=args.label_workers,
+            ).finish_existing()
 
         collector = Collector(db, PolymarketAPI())
         if args.command == "backfill":
