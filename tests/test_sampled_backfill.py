@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from informed_flow.api import Page
+from informed_flow.api import APIError, Page
 from informed_flow.cli import _export, _report
 from informed_flow.db import Database
 from informed_flow.sampled_backfill import (
@@ -257,6 +257,42 @@ class SampledBackfillTests(unittest.TestCase):
         self.assertEqual(
             self.db.row("SELECT COUNT(*) n FROM backfill_cohort_markets")["n"], 1,
         )
+
+    def test_http_500_discovery_stream_is_skipped_and_other_tags_continue(self):
+        class BrokenSportsAPI(SampleAPI):
+            def markets_page(self, cursor=None, *, closed=False, tag_id=None):
+                if str(tag_id) == self.tag_ids["sports"]:
+                    raise APIError("Gamma market feed failed", status=500, retryable=True)
+                return super().markets_page(cursor, closed=closed, tag_id=tag_id)
+
+        raw = sampled_market(
+            "finance-ok", "Will the company announce results?", "Business", "event-ok",
+        )
+        api = BrokenSportsAPI([raw])
+        runner = SampledBackfill(
+            self.db, Collector(self.db, api, clock=lambda: 2_000_100),
+            SampledBackfillConfig(
+                "skip-discovery-500", days=None, markets_per_category=1,
+                admission_rate=1.0,
+            ),
+            clock=lambda: 2_000_100,
+            embedder=FakeEmbedder({normalize_title(raw["question"]): [1.0, 0.0]}),
+        )
+        self.assertEqual(runner.run(), 0)
+        stream = self.db.row(
+            """SELECT exhausted,last_error FROM backfill_cohort_discovery_streams
+               WHERE cohort_name='skip-discovery-500' AND tag_slug='sports'"""
+        )
+        self.assertEqual(stream["exhausted"], 1)
+        self.assertIn("Gamma market feed failed", stream["last_error"])
+        self.assertEqual(
+            self.db.row(
+                """SELECT selection_status FROM backfill_cohort_markets
+                   WHERE cohort_name='skip-discovery-500' AND condition_id='finance-ok'"""
+            )["selection_status"],
+            "selected",
+        )
+        self.assertEqual(self.db.row("SELECT phase FROM backfill_cohorts")["phase"], "complete")
 
     def test_discovery_resumes_after_repeated_cursor(self):
         first_api = SampleAPI([])

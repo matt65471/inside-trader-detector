@@ -634,7 +634,27 @@ class SampledBackfill:
                             f"{row['canonical_category']!r}, expected {category!r}"
                         )
                     continue
-                tag = self.collector.api.tag_by_slug(slug)
+                try:
+                    tag = self.collector.api.tag_by_slug(slug)
+                except APIError as exc:
+                    if exc.status != 500:
+                        raise
+                    with self.db.connection:
+                        self.db.connection.execute(
+                            """INSERT INTO backfill_cohort_discovery_streams(
+                                   cohort_name,canonical_category,tag_slug,tag_id,
+                                   exhausted,last_error,updated_at
+                               ) VALUES (?,?,?,'',1,?,?)""",
+                            (
+                                self.config.cohort, category, slug, str(exc),
+                                int(self.clock()),
+                            ),
+                        )
+                    print(
+                        f"Skipping {category} tag={slug} after HTTP 500 while resolving tag",
+                        flush=True,
+                    )
+                    continue
                 tag_id = str(tag.get("id", "")).strip()
                 if not tag_id.isdigit():
                     raise APIError(f"Gamma tag {slug!r} has no numeric ID")
@@ -684,7 +704,7 @@ class SampledBackfill:
 
     def _tagged_page(
         self, stream: Mapping[str, Any], seen: dict[str, set[str | None]],
-    ) -> Any:
+    ) -> Any | None:
         slug = stream["tag_slug"]
         cursor = stream["cursor"]
         if cursor in seen.setdefault(slug, set()):
@@ -699,6 +719,24 @@ class SampledBackfill:
             return self.collector.api.markets_page(
                 cursor, closed=True, tag_id=stream["tag_id"],
             )
+        except APIError as exc:
+            with self.db.connection:
+                self.db.connection.execute(
+                    """UPDATE backfill_cohort_discovery_streams
+                       SET exhausted=?,last_error=?,updated_at=?
+                       WHERE cohort_name=? AND tag_slug=?""",
+                    (
+                        int(exc.status == 500), str(exc), int(self.clock()),
+                        self.config.cohort, slug,
+                    ),
+                )
+            if exc.status == 500:
+                print(
+                    f"Skipping {stream['canonical_category']} tag={slug} after HTTP 500",
+                    flush=True,
+                )
+                return None
+            raise
         except Exception as exc:
             with self.db.connection:
                 self.db.connection.execute(
@@ -760,6 +798,8 @@ class SampledBackfill:
                     continue
                 progressed = True
                 page = self._tagged_page(stream, seen)
+                if page is None:
+                    continue
                 candidates: list[str] = []
                 for raw in page.rows:
                     ordinal += 1
@@ -839,6 +879,8 @@ class SampledBackfill:
                     continue
                 progressed = True
                 page = self._tagged_page(stream, seen)
+                if page is None:
+                    continue
                 for raw in page.rows:
                     self._discover_market(raw, start, end)
                 self._save_discovery_stream_page(stream, page.next_cursor)

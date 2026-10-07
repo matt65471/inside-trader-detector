@@ -103,7 +103,7 @@ section for the current status, while retaining that document's research scope.
   training, profitability claims, and paper trading are **not implemented**. Do not
   train a model to reproduce the heuristic score.
 - The summary-only, tag-filtered streaming sampled-backfill, queue, resolution, and
-  labeling implementation was verified with 70 local tests. Update the validation record
+  labeling implementation was verified with 71 local tests. Update the validation record
   when subsequent code changes introduce new checks.
 
 ## Checkout and database locations
