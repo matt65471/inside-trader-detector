@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from informed_flow.api import Page
+from informed_flow.api import APIError, Page
 from informed_flow.db import Database
 from informed_flow.jobs import JobQueue
 from informed_flow.labeling import HistoricalLabeler, ResolutionStore, resolution_result
@@ -53,6 +53,19 @@ class JobQueueTests(unittest.TestCase):
             retried = queue.claim("worker-c", ("scan_market",))
             queue.succeed(retried, "worker-c")
             self.assertEqual(queue.counts(), {"succeeded": 1})
+            db.close()
+
+    def test_http_500_job_can_be_audited_as_skipped_without_becoming_dead(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "queue.sqlite3")
+            db.initialize()
+            queue = JobQueue(db, clock=lambda: 100)
+            queue.enqueue("scan_market", "scan:a", {"condition": "a"})
+            job = queue.claim("worker", ("scan_market",))
+            queue.skip(job, "worker", APIError("server error", status=500, retryable=True))
+            row = db.row("SELECT status,last_error FROM jobs WHERE job_key='scan:a'")
+            self.assertEqual(row["status"], "succeeded")
+            self.assertIn("skipped after HTTP 500", row["last_error"])
             db.close()
 
 
@@ -221,6 +234,58 @@ class PipelineAPI(SampleAPI):
 
 
 class AutomatedPipelineTests(unittest.TestCase):
+    def test_http_500_market_is_skipped_without_stopping_other_market_scans(self) -> None:
+        class OneBrokenMarketAPI(SampleAPI):
+            def trades_page(self, **kwargs):
+                condition = kwargs["condition"]
+                self.trade_requests.append(condition)
+                if condition == "condition-broken":
+                    raise APIError("temporary server failure", status=500, retryable=True)
+                return Page(self.trades.get(condition, []), None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "skip-500.sqlite3"
+            broken = sampled_market(
+                "condition-broken", "Will broken result happen?", "Business", "event-broken",
+            )
+            good = sampled_market(
+                "condition-good", "Will good result happen?", "Business", "event-good",
+            )
+            raw_trade = trade(
+                "good-trade", condition="condition-good", asset="asset-good",
+                timestamp=2_000_000, title=good["question"], slug="condition-good",
+            )
+            api = OneBrokenMarketAPI([broken, good], {"condition-good": [raw_trade]})
+            vectors = {
+                normalize_title(broken["question"]): [1.0, 0.0],
+                normalize_title(good["question"]): [0.0, 1.0],
+            }
+            pipeline = AutomatedPipeline(
+                path,
+                SampledBackfillConfig(
+                    "skip-500", days=None, markets_per_category=2, admission_rate=1.0,
+                ),
+                market_workers=1, enrichment_workers=0, resolution_workers=0,
+                label_workers=0, downstream=False, clock=lambda: 2_000_100,
+                api_factory=lambda: api, embedder=FakeEmbedder(vectors),
+            )
+            self.assertEqual(pipeline.run(), 0)
+            db = Database(path)
+            db.initialize()
+            self.assertEqual(db.row("SELECT phase FROM backfill_cohorts")["phase"], "complete")
+            self.assertEqual(db.row("SELECT COUNT(*) n FROM trades")["n"], 1)
+            broken_row = db.row(
+                "SELECT fetch_status,last_error FROM backfill_cohort_markets WHERE condition_id='condition-broken'"
+            )
+            self.assertEqual(broken_row["fetch_status"], "failed")
+            self.assertIsNotNone(broken_row["last_error"])
+            skipped = db.row(
+                "SELECT status,last_error FROM jobs WHERE entity_id='condition-broken'"
+            )
+            self.assertEqual(skipped["status"], "succeeded")
+            self.assertIn("skipped after HTTP 500", skipped["last_error"])
+            db.close()
+
     def test_sampling_only_pipeline_streams_without_downstream_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sampling-only.sqlite3"

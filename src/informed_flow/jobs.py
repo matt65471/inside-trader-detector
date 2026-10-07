@@ -176,6 +176,22 @@ class JobQueue:
                 (now, now, job.job_id, worker),
             )
 
+    def skip(self, job: Job, worker: str, error: BaseException) -> None:
+        """Finish a job without making its failure fatal to the pipeline.
+
+        The queue predates an explicit ``skipped`` state, so skipped jobs are
+        terminal successes with an audit message retained in ``last_error``.
+        The entity-specific tables still retain their failed/incomplete state.
+        """
+        now = int(self.clock())
+        with self.db.connection:
+            self.db.connection.execute(
+                """UPDATE jobs SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
+                          last_error=?,finished_at=?,updated_at=?
+                   WHERE job_id=? AND status='leased' AND lease_owner=?""",
+                (f"skipped after HTTP 500: {error}", now, now, job.job_id, worker),
+            )
+
     def defer(self, job: Job, worker: str, available_at: int) -> None:
         now = int(self.clock())
         with self.db.connection:

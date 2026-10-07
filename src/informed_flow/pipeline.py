@@ -102,13 +102,37 @@ class AutomatedPipeline:
                 except DeferredJob as exc:
                     queue.defer(job, worker_id, exc.available_at)
                 except APIError as exc:
-                    queue.fail(job, worker_id, exc, retryable=exc.retryable)
+                    if exc.status == 500 and not str(job.cohort_name or "").endswith(":live"):
+                        self._prepare_http_500_skip(db, job, exc)
+                        queue.skip(job, worker_id, exc)
+                        print(
+                            f"Skipping {job.job_kind} {job.entity_id or job.job_key} after HTTP 500",
+                            flush=True,
+                        )
+                    else:
+                        queue.fail(job, worker_id, exc, retryable=exc.retryable)
                 except Exception as exc:
                     queue.fail(job, worker_id, exc, retryable=True)
                 else:
                     queue.succeed(job, worker_id)
         finally:
             db.close()
+
+    def _prepare_http_500_skip(self, db: Database, job: Job, error: APIError) -> None:
+        """Preserve an auditable incomplete state before terminating a 500 job."""
+        if job.job_kind == "verify_resolution":
+            conditions = tuple(str(value) for value in job.payload.get("conditions", ()))
+            if not conditions:
+                return
+            placeholders = ",".join("?" for _ in conditions)
+            with db.connection:
+                db.connection.execute(
+                    f"""UPDATE backfill_cohort_markets
+                           SET eligible=0,eligibility_reason='resolution_http_500',
+                               selection_status='ineligible',fetch_status='not_selected',last_error=?
+                         WHERE cohort_name=? AND condition_id IN ({placeholders})""",
+                    (str(error), self.config.cohort, *conditions),
+                )
 
     def _run_group(
         self,
@@ -346,7 +370,10 @@ class AutomatedPipeline:
                        WHERE cohort_name=? AND condition_id=?""",
                     (f"Market scan failed for {condition}", self.config.cohort, condition),
                 )
-            raise APIError(f"Market scan failed for {condition}", retryable=True)
+            raise APIError(
+                f"Market scan failed for {condition}", retryable=True,
+                status=counts.last_api_status,
+            )
         count = db.row(
             "SELECT COUNT(*) n FROM trades WHERE condition_id=? AND trade_ts BETWEEN ? AND ?",
             (condition, job.payload["window_start"], job.payload["window_end"]),
@@ -366,7 +393,16 @@ class AutomatedPipeline:
     ) -> None:
         collector = Collector(db, api, clock=self.clock, capture_books_inline=False)
         if not collector.enrich_trade(job.payload["trade_key"]):
-            raise APIError(f"Enrichment failed for {job.payload['trade_key']}", retryable=True)
+            failure = db.row(
+                """SELECT status_code,retryable,error_message FROM collection_errors
+                   WHERE stage='enrich_trade' AND entity_id=? ORDER BY error_id DESC LIMIT 1""",
+                (job.payload["trade_key"],),
+            )
+            raise APIError(
+                failure["error_message"] if failure else f"Enrichment failed for {job.payload['trade_key']}",
+                retryable=bool(failure["retryable"]) if failure else True,
+                status=failure["status_code"] if failure else None,
+            )
 
     def _label_handler(
         self, db: Database, api: PolymarketAPI, _queue: JobQueue, job: Job, _worker: str,
@@ -384,7 +420,16 @@ class AutomatedPipeline:
             if not Collector(db, api, clock=self.clock, capture_books_inline=False).capture_book(
                 job.payload["trade_key"]
             ):
-                raise APIError(f"Book capture failed for {job.payload['trade_key']}", retryable=True)
+                failure = db.row(
+                    """SELECT status_code,retryable,error_message FROM collection_errors
+                       WHERE stage='capture_book' AND entity_id=? ORDER BY error_id DESC LIMIT 1""",
+                    (job.payload["trade_key"],),
+                )
+                raise APIError(
+                    failure["error_message"] if failure else f"Book capture failed for {job.payload['trade_key']}",
+                    retryable=bool(failure["retryable"]) if failure else True,
+                    status=failure["status_code"] if failure else None,
+                )
             return
         if job.job_kind == "resolve_market":
             condition = job.payload["condition_id"]

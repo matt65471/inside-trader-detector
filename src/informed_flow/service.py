@@ -43,6 +43,7 @@ class Counts:
     errors: int = 0
     enriched: int = 0
     high_scores: list[tuple[str, int, str]] = field(default_factory=list)
+    last_api_status: int | None = None
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -369,6 +370,7 @@ class Collector:
                 market = self._cached_or_fetch_market(trade["condition_id"])
         except APIError as exc:
             counts.errors += 1
+            counts.last_api_status = exc.status
             self.db.upsert_pending("classify_market", trade["condition_id"], str(exc), self._now())
             self.db.record_error(
                 run_id,
@@ -787,8 +789,11 @@ class Collector:
             status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
             if isinstance(exc, APIError):
                 counts.errors += 1
+                counts.last_api_status = exc.status
                 self.db.record_error(
                     run_id, "collect_page", str(exc), endpoint="data/v2/trades",
+                    entity_type="condition_id" if condition else None,
+                    entity_id=condition,
                     retryable=exc.retryable, status_code=exc.status,
                 )
             else:
