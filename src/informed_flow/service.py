@@ -310,7 +310,7 @@ class Collector:
                    VALUES (?,?,?,?,?)
                    ON CONFLICT(asset_id) DO UPDATE SET
                        outcome_name=excluded.outcome_name,
-                       outcome_index=COALESCE(excluded.outcome_index,outcomes.outcome_index)""",
+                       outcome_index=COALESCE(outcomes.outcome_index,excluded.outcome_index)""",
                 (
                     trade["asset_id"], condition_id, trade["outcome_name"],
                     trade["outcome_index"] if trade["outcome_index"] != 999 else None, now,

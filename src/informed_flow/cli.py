@@ -256,6 +256,7 @@ def _report(db: Database, high_limit: int, cohort: str | None = None) -> None:
             print(f"  embedding device fallbacks: {selected['embedding_device_log']}")
         print(
             f"  resolution_required={bool(selected['resolution_required'])} "
+            f"resolution_source={selected['resolution_source']} "
             f"resolution_status={selected['resolution_status']}"
         )
         for category in TARGET_CATEGORIES:
@@ -507,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     sampled.add_argument("--similarity-threshold", type=float, default=0.90)
     sampled.add_argument("--embedding-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     sampled.add_argument("--market-workers", type=int, default=2)
+    sampled.add_argument("--resolution-workers", type=int, default=2)
 
     run = subparsers.add_parser(
         "run", help="Run the automated resolved historical cohort pipeline"
@@ -656,10 +658,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     admission_rate=args.admission_rate,
                     similarity_threshold=args.similarity_threshold,
                     embedding_device=args.embedding_device,
+                    resolution_required=True,
                 ),
                 market_workers=args.market_workers,
                 enrichment_workers=0,
-                resolution_workers=0,
+                resolution_workers=args.resolution_workers,
                 label_workers=0,
                 downstream=False,
             ).run()

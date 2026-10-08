@@ -17,7 +17,7 @@ The most important guardrails are:
 - Ask before undertaking a large new build unless the user explicitly says to
   start implementation.
 
-## Current implementation and user decisions (2026-10-06)
+## Current implementation and user decisions (2026-10-08)
 
 The implementation now exists in `src/informed_flow/`. Some implementation-status
 statements in `docs/PROJECT_CONTEXT.md` describe an earlier checkout. Use this
@@ -77,21 +77,32 @@ section for the current status, while retaining that document's research scope.
   worth at least $1,000. Completed-trade price is not a follower's executable ask.
 - New `sampled-backfill` cohorts resolve Gamma tag slugs to numeric IDs and stream
   separate closed-market feeds for all seven categories and their aliases. Each tag
-  has a durable cursor; overlapping results deduplicate by condition ID. A seeded
+  has a durable cursor; one page per active feed is fetched concurrently in stable
+  round-robin rounds, and overlapping results deduplicate by condition ID. A seeded
   50% admission decision is made as markets arrive until every category reaches its
   quota. Same-event and >=0.90 embedding matches are rejected. If the relevant tag
   feeds exhaust, random rejects are reconsidered so the final count is
-  `min(limit, available nonredundant tagged markets)`. Selected markets collect all
-  API-served qualifying trades through a frozen cohort cutoff. Discovery strategy
-  is immutable; older global-scan cohorts require a new cohort name.
-- `run --cohort NAME` automates resolved lifetime cohorts. It verifies terminal Data
-  API resolutions before immediate embedding/selection, scans newly selected markets
-  concurrently with continued discovery, enriches the selected subset, and labels
-  every qualifying cohort trade at +15 minutes, +1 hour, and +24 hours. Live polling
-  remains opt-in through `--live`.
-- `finish-existing --cohort NAME` permanently freezes the cohort's current selection
-  and performs no further discovery or selection. It verifies the selected markets,
-  resumes their incomplete scans, and reconciles enrichment and historical label jobs.
+  `min(limit, available nonredundant tagged markets)`. Both `sampled-backfill` and
+  `run` require targeted Gamma resolution verification before embedding or selection.
+  Selected markets collect all API-served qualifying trades through a frozen cohort
+  cutoff. Discovery strategy and resolution source are immutable; legacy cohorts
+  require a new cohort name such as `balanced-tags-v2`.
+- Gamma `GET /markets?condition_ids=...&closed=true&limit=1` is authoritative for
+  historical eligibility and winner mapping. Require one exact condition row,
+  `closed=true`, aligned unique outcomes/prices/CLOB tokens, exactly one price 1 and
+  all others 0, and `umaResolutionStatus=resolved` when that field is present. Store
+  all token/outcome indexes first, raw evidence, normalized payouts, source
+  `gamma_markets_v1`, and `closedTime` only as `resolved_at`. Data `/v2/resolutions`
+  rows cannot satisfy this gate. The Data API remains in use for trades and wallet
+  enrichment.
+- `run --cohort NAME` scans newly selected markets concurrently with continued
+  discovery, enriches the selected subset, and labels every qualifying cohort trade
+  at +15 minutes, +1 hour, and +24 hours. Live polling remains opt-in through `--live`.
+- `finish-existing --cohort NAME` permanently freezes the current selection and
+  performs no further discovery, selection, or reclassification. It requires all
+  selected markets to already have Gamma verification, refuses legacy/incompatible
+  cohorts without mutation, resumes incomplete scans, and reconciles enrichment and
+  historical label jobs.
 - Exhausted HTTP 500 responses must not stop a historical cohort. During discovery,
   mark only the failing Gamma tag stream exhausted, retain its `last_error`, and
   continue other tag feeds. For queued historical resolution, scan, enrichment, and
@@ -101,7 +112,9 @@ section for the current status, while retaining that document's research scope.
 - The SQLite queue uses unique job keys, leases, crash recovery, eight attempts,
   exponential backoff, and dead-letter reporting. Trade insertion atomically adds
   downstream work, while startup reconciliation repairs missing jobs from
-  authoritative cohort/trade state.
+  authoritative cohort/trade state. Resolution jobs contain one condition ID. Scan,
+  enrichment, and label workers recheck selected plus Gamma-verified state before
+  network work; stale jobs finish as audited skips.
 - Historical labels use the first post-target price-history point within five
   minutes, with a public trade print as the approximate fallback. They never use a
   pre-target point. Gross per-share P&L is populated from verified outcome payouts;
@@ -111,8 +124,8 @@ section for the current status, while retaining that document's research scope.
 - Phase 2 historical labeling and gross-profit calculation are implemented. Model
   training, profitability claims, and paper trading are **not implemented**. Do not
   train a model to reproduce the heuristic score.
-- The summary-only, tag-filtered streaming sampled-backfill, queue, resolution, and
-  labeling implementation was verified with 72 local tests. Update the validation record
+- The summary-only, tag-filtered streaming sampled-backfill, queue, Gamma resolution,
+  and labeling implementation was verified with 80 local tests. Update the validation record
   when subsequent code changes introduce new checks.
 
 ## Checkout and database locations

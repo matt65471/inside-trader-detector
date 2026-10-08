@@ -45,9 +45,9 @@ All commands accept `--db PATH` before the subcommand. The default database is
 ```shell
 python -m informed_flow init
 python -m informed_flow backfill --days 90
-python -m informed_flow sampled-backfill --cohort balanced-lifetime
-python -m informed_flow run --cohort balanced-resolved-lifetime
-python -m informed_flow finish-existing --cohort balanced-resolved-lifetime
+python -m informed_flow sampled-backfill --cohort balanced-tags-v2
+python -m informed_flow run --cohort balanced-tags-v2
+python -m informed_flow finish-existing --cohort balanced-tags-v2
 python -m informed_flow watch --once
 python -m informed_flow watch --interval 60
 python -m informed_flow enrich
@@ -62,22 +62,27 @@ model support first:
 
 ```shell
 python -m pip install -e ".[semantic]"
-python -m informed_flow sampled-backfill --cohort balanced-lifetime \
+python -m informed_flow sampled-backfill --cohort balanced-tags-v2 \
   --markets-per-category 1000 --admission-rate 0.50 --seed 0 \
-  --similarity-threshold 0.90 --market-workers 2 \
+  --similarity-threshold 0.90 --market-workers 2 --resolution-workers 2 \
   --embedding-device auto
 ```
 
 `sampled-backfill` resolves Gamma's numeric tag IDs and scans separate closed-market
 keyset feeds for sports, crypto, weather, pop-culture, finance, geopolitics, and
 politics. Alias feeds merge elections into politics, economy/business into finance,
-and world into geopolitics. Each tag has its own durable cursor, so sparse categories
-do not wait behind unrelated sports pages and interrupted runs resume each feed
-independently. Overlapping tag results are deduplicated locally by condition ID.
+and world into geopolitics. Each tag has its own durable cursor. One page from every
+active feed is fetched concurrently per round, then processed in stable round-robin
+order, so sparse categories do not wait behind unrelated sports pages and interrupted
+runs resume each feed independently. Overlapping results deduplicate by condition ID.
 
-Feeds are processed in recent-first API order and stop as soon as every category
-reaches its target. A seeded 50% admission decision spreads the sample farther
-through recent history; admitted markets are embedded immediately. Markets from
+Feeds are processed in recent-first API order and stop after the round that fills
+every category. A seeded 50% admission decision spreads the sample farther through
+recent history. Every admitted market is first verified with the targeted Gamma call
+`/markets?condition_ids=...&closed=true&limit=1`. Only an exact matching closed row
+with aligned, unique `outcomes`, `outcomePrices`, and `clobTokenIds`, exactly one
+price of 1, all other prices 0, and no explicit non-resolved UMA status can proceed.
+Verified outcomes and token indexes are stored before trades are scanned. Markets from
 the same event and titles with embedding cosine similarity of at least 0.90 are
 rejected, and scanning continues until the quota is filled. If all relevant tag
 feeds are exhausted, random rejects are reconsidered in discovery order so
@@ -100,7 +105,7 @@ an explicit `cuda`, `mps`, or `cpu` selection is strict. Title vectors are cache
 in SQLite, so a resumed run does not need to recompute them. The local model is
 downloaded on its first use.
 
-Use `report --cohort balanced-lifetime` to inspect discovery progress, random
+Use `report --cohort balanced-tags-v2` to inspect discovery progress, random
 rejections, eligible, selected, redundant, fetched, failed, zero-trade, trade,
 event, and wallet counts by category. Passing
 the same cohort to `export` additionally writes `cohort_markets.csv`,
@@ -113,20 +118,44 @@ visible in the global report and exports.
 ## Automated resolved-market pipeline
 
 `run` is the default historical research workflow. It freezes the cohort cutoff,
-streams closed markets, verifies terminal resolutions before embedding or
+streams closed markets, verifies terminal Gamma outcomes before embedding or
 selection, selects the same balanced nonredundant lifetime sample, scans its trades,
 enriches the configured subset, and labels every qualifying cohort trade:
 
 ```shell
 python -m informed_flow --db data/informed_flow.sqlite3 run \
-  --cohort balanced-resolved-lifetime
+  --cohort balanced-tags-v2 \
+  --markets-per-category 1000 --admission-rate 0.50 --seed 0 \
+  --similarity-threshold 0.90 --market-workers 2 \
+  --enrichment-workers 2 --resolution-workers 2 --label-workers 2 \
+  --embedding-device auto
 ```
 
-Existing cohort names retain their original configuration. A cohort created by
-`sampled-backfill` cannot be silently converted into a resolution-required
-cohort; choose a new name. Missing, pending, canceled, ambiguous, and otherwise
-nonterminal resolutions are excluded before semantic selection. Finally settled
-disputed markets remain eligible, with their raw resolution evidence retained.
+PowerShell:
+
+```powershell
+python -m informed_flow --db "data\YOURDATABASE.sqlite3" run `
+  --cohort balanced-tags-v2 `
+  --markets-per-category 1000 `
+  --admission-rate 0.50 `
+  --seed 0 `
+  --similarity-threshold 0.90 `
+  --market-workers 2 `
+  --enrichment-workers 2 `
+  --resolution-workers 2 `
+  --label-workers 2 `
+  --embedding-device auto
+```
+
+Existing cohort names retain their original configuration. Use a new cohort such as
+`balanced-tags-v2`; legacy cohorts cannot be silently converted to Gamma verification.
+`sampled-backfill` now applies the same Gamma gate but intentionally stops after
+sampling and trade collection. Missing, non-one-hot, malformed, mismatched, and
+explicitly non-resolved rows are excluded before semantic selection. `closed=true`
+alone is not considered resolved. `closedTime` is the only resolution timestamp;
+when absent, `resolved_at` remains unknown. Raw Gamma evidence is retained with
+source `gamma_markets_v1`. Data `/v2/resolutions` no longer controls eligibility or
+winner mapping; the Data API remains in use for trades and wallet enrichment.
 Previously created bounded cohorts remain resumable with their original `--days`
 value; omit `--days` when creating a new lifetime cohort.
 
@@ -145,29 +174,43 @@ markets, stored trades, enrichment, and historical labels, run:
 
 ```shell
 python -m informed_flow --db data/informed_flow.sqlite3 finish-existing \
-  --cohort balanced-resolved-lifetime
+  --cohort balanced-tags-v2
 ```
 
-This freezes the current selection. It does not discover or select any additional
-markets. It verifies resolutions for the selected markets, resumes incomplete
-market scans, and reconciles enrichment and labeling jobs for stored trades.
-Re-running the command is safe: durable checkpoints and unique queue keys prevent
-completed work from being duplicated. Use the same absolute `--db` path and cohort
-name as the original run. Worker counts can be adjusted independently:
+PowerShell:
+
+```powershell
+python -m informed_flow --db "data\YOURDATABASE.sqlite3" finish-existing `
+  --cohort balanced-tags-v2
+```
+
+This freezes the current selection. It does not discover, select, or reclassify any
+markets. It requires every selected market to already have terminal
+`gamma_markets_v1` evidence, resumes incomplete scans, and reconciles enrichment and
+labeling jobs for stored trades. It refuses legacy or incompletely verified cohorts
+without changing them. Re-running the command is safe: durable checkpoints and
+unique queue keys prevent completed work from being duplicated. Use the same
+absolute `--db` path and cohort name as the original run. Worker counts can be
+adjusted independently:
 
 ```shell
 python -m informed_flow --db data/informed_flow.sqlite3 finish-existing \
-  --cohort balanced-resolved-lifetime \
+  --cohort balanced-tags-v2 \
   --market-workers 4 --enrichment-workers 4 \
   --resolution-workers 2 --label-workers 4
 ```
 
 Historical HTTP 500 handling is scoped so one upstream failure cannot terminate the
 whole cohort. A Gamma 500 during discovery exhausts and records only that tag feed,
-then discovery continues with the remaining feeds. A 500 in queued resolution,
-market-scan, enrichment, or labeling work is retained as an audited incomplete/failed
-item while other jobs continue. Live polling continues retrying instead of being
-permanently skipped.
+then discovery continues with the remaining feeds. Resolution jobs contain exactly
+one condition ID, so a targeted Gamma 500 excludes only that candidate. A 500 in
+queued resolution, market-scan, enrichment, or labeling work is retained as an
+audited incomplete/failed item while other jobs continue. Live polling continues
+retrying instead of being permanently skipped.
+
+Historical scan, enrichment, and label workers recheck that their market is still
+selected and Gamma-verified before any network call. Stale jobs are terminal audited
+skips, not work performed for an ineligible market.
 
 Historical labels use +15 minute, +1 hour, and +24 hour targets. They take the
 earliest price-history observation at or after the target, never a pre-target

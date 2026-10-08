@@ -94,23 +94,24 @@ class APITests(unittest.TestCase):
         with self.assertRaisesRegex(APIError, "repeated"):
             list(api.iter_wallet_trades("0xwallet", 99))
 
-    def test_resolution_and_price_history_endpoints(self) -> None:
+    def test_gamma_resolution_and_price_history_endpoints(self) -> None:
         class EndpointHTTP(RecordingHTTP):
             def get_json(self, base, path, params=None):
                 self.calls.append((base, path, params))
-                if path == "/v2/resolutions":
-                    return {"data": [{"condition_id": "0x1", "status": "resolved"}]}
+                if path == "/markets":
+                    return [{"conditionId": "0x1", "closed": True}]
                 return {"history": [{"t": 10, "p": 0.25}]}
 
         http = EndpointHTTP(None)
         api = PolymarketAPI(http)
-        self.assertEqual(api.resolutions(["0x1"])[0]["status"], "resolved")
+        self.assertTrue(api.resolved_markets("0x1")[0]["closed"])
         self.assertEqual(api.price_history("token", 1, 20), [{"t": 10, "p": 0.25}])
-        self.assertEqual(http.calls[0][2]["condition"], "0x1")
+        self.assertEqual(http.calls[0][0], PolymarketAPI.GAMMA_BASE)
+        self.assertEqual(http.calls[0][2], {
+            "condition_ids": "0x1", "closed": "true", "limit": 1,
+        })
         self.assertEqual(http.calls[1][2]["market"], "token")
         self.assertEqual(http.calls[1][2]["startTs"], 1)
-        with self.assertRaisesRegex(ValueError, "at most 20"):
-            api.resolutions([str(index) for index in range(21)])
 
 
 class CLITests(unittest.TestCase):
@@ -122,6 +123,7 @@ class CLITests(unittest.TestCase):
         self.assertIsNone(sampled.days)
         self.assertIsNone(automated.days)
         self.assertEqual((sampled.admission_rate, automated.admission_rate), (0.5, 0.5))
+        self.assertEqual(sampled.resolution_workers, 2)
         self.assertEqual((finish.market_workers, finish.label_workers), (2, 2))
 
     def test_market_backfill_resumes_partial_run_with_frozen_window(self) -> None:

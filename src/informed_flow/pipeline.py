@@ -1,7 +1,6 @@
 """Automated resolved-cohort collection, enrichment, labeling, and optional live mode."""
 from __future__ import annotations
 
-import hashlib
 import json
 import signal
 import sqlite3
@@ -15,8 +14,8 @@ from typing import Any, Callable, Iterable, Mapping
 from .api import APIError, PolymarketAPI
 from .core import FEATURE_VERSION
 from .db import Database
-from .jobs import DeferredJob, Job, JobQueue
-from .labeling import HORIZONS, HistoricalLabeler, ResolutionStore
+from .jobs import DeferredJob, Job, JobQueue, SkippedJob
+from .labeling import GAMMA_RESOLUTION_SOURCE, HORIZONS, HistoricalLabeler, ResolutionStore
 from .sampled_backfill import BatchEmbedder, SampledBackfill, SampledBackfillConfig
 from .service import BOOK_NOTIONAL_MICROUSD, Collector
 
@@ -101,6 +100,8 @@ class AutomatedPipeline:
                     handler(db, api, queue, job, worker_id)
                 except DeferredJob as exc:
                     queue.defer(job, worker_id, exc.available_at)
+                except SkippedJob as exc:
+                    queue.skip(job, worker_id, exc, prefix="skipped as stale/ineligible")
                 except APIError as exc:
                     if exc.status == 500 and not str(job.cohort_name or "").endswith(":live"):
                         self._prepare_http_500_skip(db, job, exc)
@@ -121,17 +122,16 @@ class AutomatedPipeline:
     def _prepare_http_500_skip(self, db: Database, job: Job, error: APIError) -> None:
         """Preserve an auditable incomplete state before terminating a 500 job."""
         if job.job_kind == "verify_resolution":
-            conditions = tuple(str(value) for value in job.payload.get("conditions", ()))
-            if not conditions:
+            condition = str(job.payload.get("condition_id") or "")
+            if not condition:
                 return
-            placeholders = ",".join("?" for _ in conditions)
             with db.connection:
                 db.connection.execute(
-                    f"""UPDATE backfill_cohort_markets
+                    """UPDATE backfill_cohort_markets
                            SET eligible=0,eligibility_reason='resolution_http_500',
                                selection_status='ineligible',fetch_status='not_selected',last_error=?
-                         WHERE cohort_name=? AND condition_id IN ({placeholders})""",
-                    (str(error), self.config.cohort, *conditions),
+                         WHERE cohort_name=? AND condition_id=?""",
+                    (str(error), self.config.cohort, condition),
                 )
 
     def _run_group(
@@ -172,44 +172,70 @@ class AutomatedPipeline:
                 """SELECT condition_id FROM backfill_cohort_markets cm
                    WHERE cohort_name=? AND eligible=1
                      AND NOT EXISTS (SELECT 1 FROM market_resolutions mr
-                                     WHERE mr.condition_id=cm.condition_id AND mr.terminal=1)
+                                     WHERE mr.condition_id=cm.condition_id AND mr.terminal=1
+                                       AND mr.source=?)
                    ORDER BY condition_id""",
-                (self.config.cohort,),
+                (self.config.cohort, GAMMA_RESOLUTION_SOURCE),
             )
             pending = [row["condition_id"] for row in rows]
         else:
             pending = [
                 condition for condition in conditions
                 if not (db.row(
-                    "SELECT terminal FROM market_resolutions WHERE condition_id=?",
-                    (condition,),
+                    """SELECT terminal FROM market_resolutions
+                       WHERE condition_id=? AND source=?""",
+                    (condition, GAMMA_RESOLUTION_SOURCE),
                 ) or {"terminal": 0})["terminal"]
             ]
-        for offset in range(0, len(pending), 20):
-            batch = pending[offset:offset + 20]
-            digest = hashlib.sha256("\0".join(batch).encode("utf-8")).hexdigest()[:20]
+        for condition in pending:
             queue.enqueue(
                 "verify_resolution",
-                f"verify_resolution:{self.config.cohort}:{digest}",
-                {"conditions": batch}, cohort=self.config.cohort,
-                entity_id=",".join(batch), priority=20,
+                f"verify_resolution:{self.config.cohort}:{condition}",
+                {"condition_id": condition}, cohort=self.config.cohort,
+                entity_id=condition, priority=20,
             )
 
     def _verify_handler(
         self, db: Database, api: PolymarketAPI, _queue: JobQueue, job: Job, _worker: str,
     ) -> None:
         ResolutionStore(db, api, clock=self.clock).verify(
-            self.config.cohort, list(job.payload["conditions"]),
+            self.config.cohort, [str(job.payload["condition_id"])],
         )
+
+    @staticmethod
+    def _gamma_verified_market(db: Database, cohort: str, condition: str) -> bool:
+        return db.row(
+            """SELECT 1 FROM backfill_cohort_markets cm
+               JOIN market_resolutions mr ON mr.condition_id=cm.condition_id
+               WHERE cm.cohort_name=? AND cm.condition_id=?
+                 AND cm.eligible=1 AND cm.selection_status='selected'
+                 AND mr.terminal=1 AND mr.source=?""",
+            (cohort, condition, GAMMA_RESOLUTION_SOURCE),
+        ) is not None
+
+    def _require_active_trade(self, db: Database, job: Job, trade_key: str) -> None:
+        if str(job.cohort_name or "").endswith(":live"):
+            return
+        trade = db.row("SELECT condition_id FROM trades WHERE trade_key=?", (trade_key,))
+        if not trade:
+            raise SkippedJob(f"unknown trade {trade_key}")
+        if not self._gamma_verified_market(
+            db, str(job.cohort_name or self.config.cohort), str(trade["condition_id"]),
+        ):
+            raise SkippedJob(
+                f"trade {trade_key} is not in a selected Gamma-verified market"
+            )
 
     def _enqueue_scans(self, db: Database, *, reopen_succeeded: bool = False) -> None:
         cohort = db.row("SELECT * FROM backfill_cohorts WHERE cohort_name=?", (self.config.cohort,))
         queue = JobQueue(db, clock=self.clock)
         for row in db.rows(
-            """SELECT condition_id FROM backfill_cohort_markets
-               WHERE cohort_name=? AND selection_status='selected'
-                 AND fetch_status IN ('pending','failed')""",
-            (self.config.cohort,),
+            """SELECT cm.condition_id FROM backfill_cohort_markets cm
+               JOIN market_resolutions mr ON mr.condition_id=cm.condition_id
+               WHERE cm.cohort_name=? AND cm.selection_status='selected'
+                 AND cm.fetch_status IN ('pending','failed')
+                 AND mr.terminal=1 AND mr.source=?""",
+            (self.config.cohort, GAMMA_RESOLUTION_SOURCE),
         ):
             self._enqueue_scan(
                 db, row["condition_id"], cohort=cohort, queue=queue,
@@ -299,10 +325,12 @@ class AutomatedPipeline:
         else:
             sql = """SELECT t.* FROM backfill_cohort_markets cm
                      JOIN backfill_cohorts c USING(cohort_name)
+                     JOIN market_resolutions mr ON mr.condition_id=cm.condition_id
                      JOIN trades t ON t.condition_id=cm.condition_id
                                   AND t.trade_ts BETWEEN c.window_start AND c.window_end
-                     WHERE cm.cohort_name=? AND cm.selection_status='selected'"""
-            params = (cohort,)
+                     WHERE cm.cohort_name=? AND cm.selection_status='selected'
+                       AND mr.terminal=1 AND mr.source=?"""
+            params = (cohort, GAMMA_RESOLUTION_SOURCE)
             if condition:
                 sql += " AND t.condition_id=?"
                 params += (condition,)
@@ -351,6 +379,8 @@ class AutomatedPipeline:
         )
         if not row:
             raise ValueError(f"Unknown cohort market: {condition}")
+        if not self._gamma_verified_market(db, self.config.cohort, condition):
+            raise SkippedJob(f"market {condition} is not selected and Gamma-verified")
         checkpoint = f"sampled:{self.config.cohort}:{condition}"
         saved = db.checkpoint(checkpoint)
         collector = Collector(
@@ -396,12 +426,14 @@ class AutomatedPipeline:
     def _enrich_handler(
         self, db: Database, api: PolymarketAPI, _queue: JobQueue, job: Job, _worker: str,
     ) -> None:
+        trade_key = str(job.payload["trade_key"])
+        self._require_active_trade(db, job, trade_key)
         collector = Collector(db, api, clock=self.clock, capture_books_inline=False)
-        if not collector.enrich_trade(job.payload["trade_key"]):
+        if not collector.enrich_trade(trade_key):
             failure = db.row(
                 """SELECT status_code,retryable,error_message FROM collection_errors
                    WHERE stage='enrich_trade' AND entity_id=? ORDER BY error_id DESC LIMIT 1""",
-                (job.payload["trade_key"],),
+                (trade_key,),
             )
             raise APIError(
                 failure["error_message"] if failure else f"Enrichment failed for {job.payload['trade_key']}",
@@ -414,6 +446,7 @@ class AutomatedPipeline:
     ) -> None:
         labeler = HistoricalLabeler(db, api, clock=self.clock)
         if job.job_kind == "observe_entry":
+            self._require_active_trade(db, job, str(job.payload["trade_key"]))
             if job.payload.get("live"):
                 labeler.observe_live(job.payload["trade_key"], int(job.payload["horizon"]))
             else:
@@ -439,7 +472,11 @@ class AutomatedPipeline:
         if job.job_kind == "resolve_market":
             condition = job.payload["condition_id"]
             ResolutionStore(db, api, clock=self.clock).verify("__live__", [condition])
-            row = db.row("SELECT terminal FROM market_resolutions WHERE condition_id=?", (condition,))
+            row = db.row(
+                """SELECT terminal FROM market_resolutions
+                   WHERE condition_id=? AND source=?""",
+                (condition, GAMMA_RESOLUTION_SOURCE),
+            )
             if not row or not row["terminal"]:
                 raise DeferredJob(int(self.clock()) + 6 * 3600)
             labeler.finalize_market(condition)
@@ -604,6 +641,42 @@ class AutomatedPipeline:
             if not cohort:
                 print(f"Unknown cohort: {self.config.cohort}", file=sys.stderr)
                 return 1
+            if (
+                not cohort["resolution_required"] or
+                cohort["resolution_source"] != GAMMA_RESOLUTION_SOURCE
+            ):
+                print(
+                    f"Cohort {self.config.cohort!r} is legacy or was created without "
+                    "Gamma-required resolution verification; finish-existing refuses "
+                    "to change its frozen selection. Start a new cohort instead.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            selected = [
+                row["condition_id"] for row in db.rows(
+                    """SELECT condition_id FROM backfill_cohort_markets
+                       WHERE cohort_name=? AND selection_status='selected'
+                       ORDER BY condition_id""",
+                    (self.config.cohort,),
+                )
+            ]
+            missing = [
+                condition for condition in selected
+                if not db.row(
+                    """SELECT 1 FROM market_resolutions
+                       WHERE condition_id=? AND terminal=1 AND source=?""",
+                    (condition, GAMMA_RESOLUTION_SOURCE),
+                )
+            ]
+            if missing:
+                print(
+                    f"Cohort {self.config.cohort!r} has {len(missing)} selected markets "
+                    "without Gamma verification; finish-existing will not alter the "
+                    "selection. Resume run for this cohort first.",
+                    file=sys.stderr,
+                )
+                return 1
             with db.connection:
                 db.connection.execute(
                     """UPDATE backfill_cohorts
@@ -614,26 +687,6 @@ class AutomatedPipeline:
                     (int(self.clock()), self.config.cohort),
                 )
             JobQueue(db, clock=self.clock).recover_expired(self.config.cohort)
-
-            selected = [
-                row["condition_id"] for row in db.rows(
-                    """SELECT condition_id FROM backfill_cohort_markets
-                       WHERE cohort_name=? AND selection_status='selected'
-                       ORDER BY condition_id""",
-                    (self.config.cohort,),
-                )
-            ]
-            self._enqueue_resolution_verification(db, selected)
-            if self._run_group(
-                db, ("verify_resolution",), self.resolution_workers, self._verify_handler,
-            ):
-                with db.connection:
-                    db.connection.execute(
-                        """UPDATE backfill_cohorts SET resolution_status='failed',last_error=?,updated_at=?
-                           WHERE cohort_name=?""",
-                        ("resolution jobs failed", int(self.clock()), self.config.cohort),
-                    )
-                return 1
             with db.connection:
                 db.connection.execute(
                     """UPDATE backfill_cohorts SET resolution_status='complete',updated_at=?

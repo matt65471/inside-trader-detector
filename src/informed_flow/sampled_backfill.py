@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
@@ -52,6 +53,7 @@ class SampledBackfillConfig:
     embedding_device: str = "auto"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     resolution_required: bool = False
+    resolution_source: str = "gamma_markets_v1"
 
 
 class BatchEmbedder(Protocol):
@@ -288,6 +290,7 @@ class SampledBackfill:
                 "similarity_threshold_ppm": self.threshold_ppm,
                 "requested_device": self.config.embedding_device,
                 "resolution_required": int(self.config.resolution_required),
+                "resolution_source": self.config.resolution_source,
             }
             changed = [key for key, value in expected.items() if row[key] != value]
             if changed:
@@ -315,8 +318,9 @@ class SampledBackfill:
                        cohort_name,window_start,window_end,days,category_limit,seed,
                        embedding_model,similarity_threshold_ppm,requested_device,
                        history_mode,admission_rate_ppm,discovery_strategy,
-                       resolution_required,resolution_status,phase,created_at,updated_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'discovering',?,?)""",
+                       resolution_required,resolution_source,resolution_status,
+                       phase,created_at,updated_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'discovering',?,?)""",
                 (
                     self.config.cohort, start, end, self.config.days or 0,
                     self.config.markets_per_category, self.config.seed,
@@ -324,6 +328,7 @@ class SampledBackfill:
                     self.config.embedding_device, self.history_mode, self.admission_rate_ppm,
                     DISCOVERY_STRATEGY,
                     int(self.config.resolution_required),
+                    self.config.resolution_source,
                     "pending" if self.config.resolution_required else "not_required", now, now,
                 ),
             )
@@ -702,49 +707,64 @@ class SampledBackfill:
                 (now, self.config.cohort),
             )
 
-    def _tagged_page(
-        self, stream: Mapping[str, Any], seen: dict[str, set[str | None]],
-    ) -> Any | None:
-        slug = stream["tag_slug"]
-        cursor = stream["cursor"]
-        if cursor in seen.setdefault(slug, set()):
-            raise APIError(f"Gamma repeated a discovery cursor for tag {slug}")
-        seen[slug].add(cursor)
-        print(
-            f"Streaming {stream['canonical_category']} tag={slug} "
-            f"({stream['tag_id']}) cursor={cursor or 'start'}",
-            flush=True,
-        )
-        try:
-            return self.collector.api.markets_page(
-                cursor, closed=True, tag_id=stream["tag_id"],
+    def _tagged_pages(
+        self, streams: Sequence[Mapping[str, Any]], seen: dict[str, set[str | None]],
+    ) -> list[tuple[Mapping[str, Any], Any | None]]:
+        """Fetch one durable round-robin page from each active tag concurrently."""
+        requests: list[Mapping[str, Any]] = []
+        for stream in streams:
+            slug = stream["tag_slug"]
+            cursor = stream["cursor"]
+            if cursor in seen.setdefault(slug, set()):
+                raise APIError(f"Gamma repeated a discovery cursor for tag {slug}")
+            seen[slug].add(cursor)
+            print(
+                f"Streaming {stream['canonical_category']} tag={slug} "
+                f"({stream['tag_id']}) cursor={cursor or 'start'}",
+                flush=True,
             )
-        except APIError as exc:
-            with self.db.connection:
-                self.db.connection.execute(
-                    """UPDATE backfill_cohort_discovery_streams
-                       SET exhausted=?,last_error=?,updated_at=?
-                       WHERE cohort_name=? AND tag_slug=?""",
-                    (
-                        int(exc.status == 500), str(exc), int(self.clock()),
-                        self.config.cohort, slug,
-                    ),
-                )
-            if exc.status == 500:
-                print(
-                    f"Skipping {stream['canonical_category']} tag={slug} after HTTP 500",
-                    flush=True,
-                )
-                return None
-            raise
-        except Exception as exc:
-            with self.db.connection:
-                self.db.connection.execute(
-                    """UPDATE backfill_cohort_discovery_streams
-                       SET last_error=?,updated_at=? WHERE cohort_name=? AND tag_slug=?""",
-                    (str(exc), int(self.clock()), self.config.cohort, slug),
-                )
-            raise
+            requests.append(stream)
+
+        def fetch(stream: Mapping[str, Any]) -> Any:
+            return self.collector.api.markets_page(
+                stream["cursor"], closed=True, tag_id=stream["tag_id"],
+            )
+
+        results: list[tuple[Mapping[str, Any], Any | None]] = []
+        with ThreadPoolExecutor(max_workers=min(len(requests), 11)) as executor:
+            futures = [(stream, executor.submit(fetch, stream)) for stream in requests]
+            for stream, future in futures:
+                slug = stream["tag_slug"]
+                try:
+                    results.append((stream, future.result()))
+                except APIError as exc:
+                    with self.db.connection:
+                        self.db.connection.execute(
+                            """UPDATE backfill_cohort_discovery_streams
+                               SET exhausted=?,last_error=?,updated_at=?
+                               WHERE cohort_name=? AND tag_slug=?""",
+                            (
+                                int(exc.status == 500), str(exc), int(self.clock()),
+                                self.config.cohort, slug,
+                            ),
+                        )
+                    if exc.status != 500:
+                        raise
+                    print(
+                        f"Skipping {stream['canonical_category']} tag={slug} after HTTP 500",
+                        flush=True,
+                    )
+                    results.append((stream, None))
+                except Exception as exc:
+                    with self.db.connection:
+                        self.db.connection.execute(
+                            """UPDATE backfill_cohort_discovery_streams
+                               SET last_error=?,updated_at=?
+                               WHERE cohort_name=? AND tag_slug=?""",
+                            (str(exc), int(self.clock()), self.config.cohort, slug),
+                        )
+                    raise
+        return results
 
     def stream_select(
         self,
@@ -788,16 +808,19 @@ class SampledBackfill:
         seen: dict[str, set[str | None]] = {}
         exhausted = False
         while not self._quotas_full(state):
-            progressed = False
             streams = self._ensure_discovery_streams()
+            active = []
             for stream in streams:
                 category = stream["canonical_category"]
                 if stream["exhausted"] or (
                     len(state[category]["ids"]) >= self.config.markets_per_category
                 ):
                     continue
-                progressed = True
-                page = self._tagged_page(stream, seen)
+                active.append(stream)
+            if not active:
+                exhausted = True
+                break
+            for stream, page in self._tagged_pages(active, seen):
                 if page is None:
                     continue
                 candidates: list[str] = []
@@ -831,11 +854,6 @@ class SampledBackfill:
                 for condition in candidates:
                     self._select_streaming_row(condition, state, on_selected)
                 self._save_discovery_stream_page(stream, page.next_cursor)
-                if self._quotas_full(state):
-                    break
-            if not progressed:
-                exhausted = True
-                break
 
         if exhausted and not self._quotas_full(state):
             # The random filter must not reduce the attainable final sample. Revisit
@@ -873,24 +891,22 @@ class SampledBackfill:
         seen: dict[str, set[str | None]] = {}
         start, end = int(cohort["window_start"]), int(cohort["window_end"])
         while True:
-            progressed = False
-            for stream in self._ensure_discovery_streams():
-                if stream["exhausted"]:
-                    continue
-                progressed = True
-                page = self._tagged_page(stream, seen)
+            active = [
+                stream for stream in self._ensure_discovery_streams()
+                if not stream["exhausted"]
+            ]
+            if not active:
+                self._update_cohort(
+                    discovery_cursor=None, discovery_complete=1,
+                    discovery_stop_reason="tags_exhausted", phase="embedding", last_error=None,
+                )
+                return
+            for stream, page in self._tagged_pages(active, seen):
                 if page is None:
                     continue
                 for raw in page.rows:
                     self._discover_market(raw, start, end)
                 self._save_discovery_stream_page(stream, page.next_cursor)
-            if progressed:
-                continue
-            self._update_cohort(
-                discovery_cursor=None, discovery_complete=1, discovery_stop_reason="tags_exhausted",
-                phase="embedding", last_error=None,
-            )
-            return
 
     def ensure_embeddings(self) -> None:
         rows = self.db.rows(

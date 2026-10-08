@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
@@ -14,40 +15,111 @@ from .service import parse_book
 
 HORIZONS = (900, 3600, 86400)
 PRICE_TOLERANCE_SECONDS = 300
-TERMINAL_STATUSES = {"resolved", "finalized", "settled", "complete", "completed"}
+GAMMA_RESOLUTION_SOURCE = "gamma_markets_v1"
 _PRICE_LOCK_GUARD = threading.Lock()
 _PRICE_LOCKS: dict[tuple[str, str, str, int], threading.Lock] = {}
 
 
-def _payouts(raw: Mapping[str, Any]) -> list[Decimal]:
-    values = raw.get("payouts")
-    if not isinstance(values, list):
-        return []
+def _array(value: Any) -> list[Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return list(value) if isinstance(value, list) else None
+
+
+@dataclass(frozen=True)
+class GammaResolutionEvidence:
+    terminal: bool
+    winner: int | None
+    status: str
+    quality: str
+    outcomes: tuple[str, ...] = ()
+    prices: tuple[Decimal, ...] = ()
+    tokens: tuple[str, ...] = ()
+
+
+def gamma_resolution_evidence(
+    raw: Mapping[str, Any], expected_condition: str | None = None,
+) -> GammaResolutionEvidence:
+    condition = str(first(raw, "conditionId", "condition_id", default="")).strip().lower()
+    if expected_condition is not None and condition != expected_condition.strip().lower():
+        return GammaResolutionEvidence(False, None, "missing", "condition_mismatch")
+
+    uma_value = first(raw, "umaResolutionStatus", "uma_resolution_status")
+    uma_status = str(uma_value).strip().lower() if uma_value not in (None, "") else None
+    status = uma_status or ("closed" if raw.get("closed") is True else "open")
+    if raw.get("closed") is not True:
+        return GammaResolutionEvidence(False, None, status, "not_closed")
+
+    outcome_values = _array(first(raw, "outcomes"))
+    price_values = _array(first(raw, "outcomePrices", "outcome_prices"))
+    token_values = _array(first(raw, "clobTokenIds", "clob_token_ids"))
+    if outcome_values is None:
+        return GammaResolutionEvidence(False, None, status, "missing_outcomes")
+    if price_values is None:
+        return GammaResolutionEvidence(False, None, status, "missing_outcome_prices")
+    if token_values is None:
+        return GammaResolutionEvidence(False, None, status, "missing_clob_tokens")
+
+    if any(not isinstance(value, str) for value in outcome_values):
+        return GammaResolutionEvidence(False, None, status, "invalid_outcomes")
+    if any(not isinstance(value, str) for value in token_values):
+        return GammaResolutionEvidence(False, None, status, "invalid_clob_tokens")
+    outcomes = tuple(value.strip() for value in outcome_values)
+    tokens = tuple(value.strip() for value in token_values)
     try:
-        return [Decimal(str(value)) for value in values]
+        prices = tuple(Decimal(str(value)) for value in price_values)
     except (InvalidOperation, ValueError):
-        return []
+        return GammaResolutionEvidence(False, None, status, "invalid_outcome_prices")
+    if any(not price.is_finite() for price in prices):
+        return GammaResolutionEvidence(False, None, status, "invalid_outcome_prices")
+
+    if not outcomes or len(outcomes) != len(prices) or len(outcomes) != len(tokens):
+        return GammaResolutionEvidence(False, None, status, "outcome_length_mismatch")
+    if any(not value for value in outcomes):
+        return GammaResolutionEvidence(False, None, status, "empty_outcome")
+    if any(not value for value in tokens):
+        return GammaResolutionEvidence(False, None, status, "empty_clob_token")
+    if len({value.casefold() for value in outcomes}) != len(outcomes):
+        return GammaResolutionEvidence(False, None, status, "duplicate_outcomes")
+    if len(set(tokens)) != len(tokens):
+        return GammaResolutionEvidence(False, None, status, "duplicate_clob_tokens")
+
+    winners = [index for index, price in enumerate(prices) if price == Decimal(1)]
+    if len(winners) != 1 or any(price not in (Decimal(0), Decimal(1)) for price in prices):
+        return GammaResolutionEvidence(
+            False, None, status, "ambiguous_outcome_prices", outcomes, prices, tokens,
+        )
+    if uma_status is not None and uma_status != "resolved":
+        return GammaResolutionEvidence(
+            False, None, uma_status, "nonterminal_resolution", outcomes, prices, tokens,
+        )
+    return GammaResolutionEvidence(
+        True, winners[0], uma_status or "resolved", "terminal_outcome_prices",
+        outcomes, prices, tokens,
+    )
 
 
 def resolution_result(raw: Mapping[str, Any]) -> tuple[bool, int | None, str, str]:
-    payouts = _payouts(raw)
-    scale = max(payouts, default=Decimal(0))
-    # Data API v2 serves micro-USDC payouts; accept the older normalized fixture
-    # form as well so stored evidence from either API generation remains usable.
-    binary = scale in (Decimal(1), Decimal(1_000_000)) and all(
-        value in (0, scale) for value in payouts
-    )
-    winners = [index for index, value in enumerate(payouts) if value == scale]
-    binary = binary and len(winners) == 1
-    status = str(raw.get("status") or "unknown").lower()
-    terminal = binary and status in TERMINAL_STATUSES
-    if terminal:
-        return True, winners[0], status, "terminal_payout"
-    if not payouts:
-        return False, None, status, "missing_payouts"
-    if not binary:
-        return False, None, status, "ambiguous_payouts"
-    return False, None, status, "nonterminal_resolution"
+    """Compatibility wrapper exposing the normalized Gamma resolution decision."""
+    evidence = gamma_resolution_evidence(raw)
+    return evidence.terminal, evidence.winner, evidence.status, evidence.quality
+
+
+def _explicit_dispute(raw: Mapping[str, Any]) -> bool:
+    for key in ("wasDisputed", "was_disputed", "disputed", "umaDisputed"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+    return False
 
 
 class ResolutionStore:
@@ -57,20 +129,99 @@ class ResolutionStore:
         self.clock = clock
 
     def verify(self, cohort: str, conditions: list[str]) -> None:
-        rows = self.api.resolutions(conditions)
-        by_condition = {
-            str(first(row, "condition_id", "conditionId", default="")).lower(): row
-            for row in rows
-        }
         now = int(self.clock())
-        with self.db.connection:
-            for condition in conditions:
-                raw = by_condition.get(condition.lower())
-                if raw is None:
-                    terminal, winner, status, quality = False, None, "missing", "missing_resolution"
-                    raw = {}
-                else:
-                    terminal, winner, status, quality = resolution_result(raw)
+        for condition in conditions:
+            rows = self.api.resolved_markets(condition)
+            raw: Mapping[str, Any] = rows[0] if len(rows) == 1 else {}
+            if not rows:
+                evidence = GammaResolutionEvidence(False, None, "missing", "missing_resolution")
+            elif len(rows) != 1:
+                evidence = GammaResolutionEvidence(False, None, "ambiguous", "ambiguous_response")
+            else:
+                evidence = gamma_resolution_evidence(raw, condition)
+
+            if evidence.terminal:
+                placeholders = ",".join("?" for _ in evidence.tokens)
+                conflicts = self.db.rows(
+                    f"""SELECT asset_id,condition_id FROM outcomes
+                         WHERE asset_id IN ({placeholders}) AND condition_id!=?""",
+                    (*evidence.tokens, condition),
+                )
+                if conflicts:
+                    evidence = replace(
+                        evidence, terminal=False, winner=None, quality="token_condition_conflict",
+                    )
+
+            with self.db.connection:
+                if evidence.terminal:
+                    cohort_market = self.db.connection.execute(
+                        """SELECT title,canonical_category,raw_json
+                           FROM backfill_cohort_markets
+                           WHERE cohort_name=? AND condition_id=?""",
+                        (cohort, condition),
+                    ).fetchone()
+                    fallback_raw = json.loads(cohort_market["raw_json"]) if cohort_market else {}
+                    event_rows = first(raw, "events", default=[]) or []
+                    event = event_rows[0] if event_rows and isinstance(event_rows[0], Mapping) else {}
+                    fee_schedule = first(raw, "feeSchedule", "fee_schedule", default={}) or {}
+                    category = (
+                        cohort_market["canonical_category"] if cohort_market else
+                        first(event, "category", default=first(raw, "category"))
+                    )
+                    title = str(
+                        first(raw, "question", "title", default=
+                              cohort_market["title"] if cohort_market else condition)
+                    )
+                    slug = str(first(raw, "slug", default=first(fallback_raw, "slug", default=condition)))
+                    fee_rate = first(fee_schedule, "rate")
+                    try:
+                        fee_rate_ppm = to_millionths(fee_rate) if fee_rate is not None else None
+                    except (InvalidOperation, TypeError, ValueError):
+                        fee_rate_ppm = None
+                    self.db.connection.execute(
+                        """INSERT INTO markets(
+                               condition_id,event_id,title,slug,event_slug,category,start_ts,end_ts,
+                               is_sports,accepting_orders,closed,fees_enabled,fee_rate_ppm,
+                               first_seen_at,last_refreshed_at
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(condition_id) DO UPDATE SET
+                               event_id=COALESCE(excluded.event_id,markets.event_id),
+                               title=excluded.title,slug=excluded.slug,
+                               event_slug=COALESCE(excluded.event_slug,markets.event_slug),
+                               category=COALESCE(excluded.category,markets.category),
+                               start_ts=COALESCE(excluded.start_ts,markets.start_ts),
+                               end_ts=COALESCE(excluded.end_ts,markets.end_ts),
+                               is_sports=excluded.is_sports,
+                               accepting_orders=excluded.accepting_orders,closed=excluded.closed,
+                               fees_enabled=excluded.fees_enabled,
+                               fee_rate_ppm=COALESCE(excluded.fee_rate_ppm,markets.fee_rate_ppm),
+                               last_refreshed_at=excluded.last_refreshed_at""",
+                        (
+                            condition, str(first(event, "id", default="")) or None,
+                            title, slug, str(first(event, "slug", default="")) or None,
+                            str(category).strip().lower() if category else None,
+                            parse_timestamp(first(raw, "startDate", "start_date")),
+                            parse_timestamp(first(raw, "endDate", "end_date", "endDateIso")),
+                            int(bool(first(raw, "sportsMarketType", "sports_market_type", "gameStartTime"))),
+                            int(bool(first(raw, "acceptingOrders", "accepting_orders", default=False))),
+                            1, int(bool(first(raw, "feesEnabled", "fees_enabled", default=False))),
+                            fee_rate_ppm, now, now,
+                        ),
+                    )
+                    self.db.connection.executemany(
+                        """INSERT INTO outcomes(
+                               asset_id,condition_id,outcome_name,outcome_index,first_seen_at
+                           ) VALUES (?,?,?,?,?)
+                           ON CONFLICT(asset_id) DO UPDATE SET
+                               outcome_name=excluded.outcome_name,
+                               outcome_index=excluded.outcome_index""",
+                        [
+                            (token, condition, outcome, index, now)
+                            for index, (token, outcome) in enumerate(
+                                zip(evidence.tokens, evidence.outcomes)
+                            )
+                        ],
+                    )
                 self.db.connection.execute(
                     """INSERT INTO market_resolutions(
                            condition_id,status,terminal,winning_outcome_index,payouts_json,
@@ -84,19 +235,21 @@ class ResolutionStore:
                            quality=excluded.quality,raw_json=excluded.raw_json,
                            checked_at=excluded.checked_at,error_message=NULL""",
                     (
-                        condition, status, int(terminal), winner,
-                        canonical_json(raw.get("payouts")) if raw.get("payouts") is not None else None,
-                        parse_timestamp(raw.get("resolved_at")), int(bool(raw.get("was_disputed"))),
-                        "data_v2_resolutions", quality, canonical_json(raw), now,
+                        condition, evidence.status, int(evidence.terminal), evidence.winner,
+                        canonical_json([str(value) for value in evidence.prices])
+                        if evidence.prices else None,
+                        parse_timestamp(first(raw, "closedTime", "closed_time")),
+                        int(_explicit_dispute(raw)), GAMMA_RESOLUTION_SOURCE,
+                        evidence.quality, canonical_json(rows), now,
                     ),
                 )
-                if not terminal:
+                if not evidence.terminal:
                     self.db.connection.execute(
                         """UPDATE backfill_cohort_markets SET eligible=0,
                                   eligibility_reason=?,selection_status='ineligible',
                                   fetch_status='not_selected'
                            WHERE cohort_name=? AND condition_id=?""",
-                        (quality, cohort, condition),
+                        (evidence.quality, cohort, condition),
                     )
 
 
@@ -108,7 +261,7 @@ class HistoricalLabeler:
 
     def _resolution(self, condition: str) -> Mapping[str, Any]:
         row = self.db.row("SELECT * FROM market_resolutions WHERE condition_id=?", (condition,))
-        if not row or not row["terminal"]:
+        if not row or not row["terminal"] or row["source"] != GAMMA_RESOLUTION_SOURCE:
             raise APIError(f"No terminal resolution for {condition}", retryable=True)
         return row
 
@@ -195,8 +348,9 @@ class HistoricalLabeler:
         book: Mapping[str, Any] | None = None,
     ) -> None:
         resolution = self.db.row(
-            "SELECT * FROM market_resolutions WHERE condition_id=? AND terminal=1",
-            (str(trade["condition_id"]),),
+            """SELECT * FROM market_resolutions
+               WHERE condition_id=? AND terminal=1 AND source=?""",
+            (str(trade["condition_id"]), GAMMA_RESOLUTION_SOURCE),
         )
         outcome_index = trade["outcome_index"]
         won = (

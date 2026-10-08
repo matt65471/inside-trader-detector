@@ -182,17 +182,16 @@ class PolymarketAPI:
                 return dict(rows[0])
         return None
 
-    def resolutions(self, condition_ids: list[str]) -> list[dict[str, Any]]:
-        if not condition_ids:
-            return []
-        if len(condition_ids) > 20:
-            raise ValueError("Resolution requests accept at most 20 conditions")
+    def resolved_markets(self, condition_id: str) -> list[dict[str, Any]]:
+        """Return the targeted closed Gamma row used as resolution evidence."""
         payload = self.http.get_json(
-            self.DATA_BASE, "/v2/resolutions", {"condition": ",".join(condition_ids)},
+            self.GAMMA_BASE,
+            "/markets",
+            {"condition_ids": condition_id, "closed": "true", "limit": 1},
         )
-        rows = payload.get("data") if isinstance(payload, Mapping) else None
+        rows = payload.get("data") if isinstance(payload, Mapping) else payload
         if not isinstance(rows, list):
-            raise APIError("Resolution response has an unexpected shape")
+            raise APIError("Gamma resolution lookup has an unexpected shape")
         return [dict(row) for row in rows if isinstance(row, Mapping)]
 
     def price_history(

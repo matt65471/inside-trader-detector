@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -320,6 +320,7 @@ CREATE TABLE IF NOT EXISTS backfill_cohorts (
     discovery_stop_reason TEXT,
     discovery_strategy TEXT NOT NULL DEFAULT 'tag_filtered_v1',
     resolution_required INTEGER NOT NULL DEFAULT 0 CHECK (resolution_required IN (0,1)),
+    resolution_source TEXT NOT NULL DEFAULT 'data_v2_resolutions',
     resolution_status TEXT NOT NULL DEFAULT 'not_required',
     phase TEXT NOT NULL CHECK (
         phase IN ('discovering','embedding','selecting','fetching','complete','failed')
@@ -508,6 +509,10 @@ class Database:
             self._ensure_column(
                 "backfill_cohorts", "resolution_status",
                 "TEXT NOT NULL DEFAULT 'not_required'",
+            )
+            self._ensure_column(
+                "backfill_cohorts", "resolution_source",
+                "TEXT NOT NULL DEFAULT 'data_v2_resolutions'",
             )
             for name, declaration in (
                 ("history_mode", "TEXT NOT NULL DEFAULT 'bounded_days'"),

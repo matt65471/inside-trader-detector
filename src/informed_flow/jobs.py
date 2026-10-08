@@ -32,6 +32,10 @@ class DeferredJob(RuntimeError):
         self.available_at = available_at
 
 
+class SkippedJob(RuntimeError):
+    """A stale or inapplicable job should finish with an audit message."""
+
+
 class JobQueue:
     def __init__(self, db: Database, *, clock=time.time):
         self.db = db
@@ -176,7 +180,10 @@ class JobQueue:
                 (now, now, job.job_id, worker),
             )
 
-    def skip(self, job: Job, worker: str, error: BaseException) -> None:
+    def skip(
+        self, job: Job, worker: str, error: BaseException, *,
+        prefix: str = "skipped after HTTP 500",
+    ) -> None:
         """Finish a job without making its failure fatal to the pipeline.
 
         The queue predates an explicit ``skipped`` state, so skipped jobs are
@@ -189,7 +196,7 @@ class JobQueue:
                 """UPDATE jobs SET status='succeeded',lease_owner=NULL,lease_expires_at=NULL,
                           last_error=?,finished_at=?,updated_at=?
                    WHERE job_id=? AND status='leased' AND lease_owner=?""",
-                (f"skipped after HTTP 500: {error}", now, now, job.job_id, worker),
+                (f"{prefix}: {error}", now, now, job.job_id, worker),
             )
 
     def defer(self, job: Job, worker: str, available_at: int) -> None:

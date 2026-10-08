@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +35,11 @@ def sampled_market(
         "question": title,
         "slug": condition,
         "closed": True,
+        "closedTime": 2_100_000,
+        "umaResolutionStatus": "resolved",
+        "outcomes": json.dumps(["Yes", "No"]),
+        "outcomePrices": json.dumps(["1", "0"]),
+        "clobTokenIds": json.dumps([f"asset-{condition}", f"asset-no-{condition}"]),
         "createdAt": "1970-01-20T00:00:00Z",
         "endDate": "1970-01-30T00:00:00Z",
         "events": [{
@@ -70,8 +76,12 @@ class SampleAPI(FakeAPI):
             if slug:
                 self.markets_by_tag[self.tag_ids[slug]].append(row)
         self.market_requests: list[tuple[str | None, bool, str | None]] = []
+        self.resolution_requests: list[str] = []
         self.trade_requests: list[str] = []
         self.trades = trades or {}
+        self.markets_by_condition = {
+            str(row["conditionId"]).lower(): row for row in markets if row.get("conditionId")
+        }
 
     def tag_by_slug(self, slug):
         return {"id": self.tag_ids[slug], "slug": slug}
@@ -86,6 +96,11 @@ class SampleAPI(FakeAPI):
         condition = kwargs["condition"]
         self.trade_requests.append(condition)
         return Page(self.trades.get(condition, []), None)
+
+    def resolved_markets(self, condition_id):
+        self.resolution_requests.append(condition_id)
+        row = self.markets_by_condition.get(str(condition_id).lower())
+        return [dict(row)] if row is not None else []
 
 
 class FakeEmbedder:
@@ -370,7 +385,10 @@ class SampledBackfillTests(unittest.TestCase):
             clock=lambda: 10_000_000, embedder=FakeEmbedder(vectors),
         )
         runner.stream_select()
-        self.assertEqual(api.market_requests, [(None, True, "1")])
+        self.assertEqual(len(api.market_requests), len(api.tag_ids))
+        self.assertEqual(
+            {request[2] for request in api.market_requests}, set(api.tag_ids.values()),
+        )
         cohort = self.db.row("SELECT * FROM backfill_cohorts")
         self.assertEqual(cohort["history_mode"], "lifetime")
         self.assertEqual(cohort["window_start"], 1)
