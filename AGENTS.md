@@ -3,7 +3,8 @@
 Before planning or implementing work in this repository, read
 [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md). It records the agreed scope,
 architecture, data sources, constraints, and phased plan for the informed-flow
-detector.
+detector. Before any Phase 2 dataset construction or modeling, also read
+[`docs/PHASE_2_TRAINING.md`](docs/PHASE_2_TRAINING.md).
 
 The most important guardrails are:
 
@@ -121,49 +122,180 @@ section for the current status, while retaining that document's research scope.
   historical fees and net P&L remain null without a verified time-applicable source.
   Historical prices never imply order-book depth. Optional live labels retain book
   and $100/$500/$1,000 fill scenarios.
-- Phase 2 historical labeling and gross-profit calculation are implemented. Model
-  training, profitability claims, and paper trading are **not implemented**. Do not
-  train a model to reproduce the heuristic score.
+- The user's current phase naming treats the entire acquisition, verification,
+  enrichment, and labeling system as **Phase 1: data pipeline**. That implementation
+  is complete. The active dataset still has to finish its queued work before its
+  final counts are recorded. **Phase 2** is supervised model training; it is not yet
+  implemented. See [`docs/PHASE_2_TRAINING.md`](docs/PHASE_2_TRAINING.md) for the
+  training handoff. Do not train a model to reproduce the heuristic score.
 - The summary-only, tag-filtered streaming sampled-backfill, queue, Gamma resolution,
-  and labeling implementation was verified with 80 local tests. Update the validation record
+  and labeling implementation plus the read-only Phase 2 audit were verified with 82 local tests. Update the validation record
   when subsequent code changes introduce new checks.
+
+## Phase 1 operational handoff
+
+The active historical dataset is on the Windows collection machine:
+
+- Checkout: `C:\Users\matt6\projects\inside-trader-detector`
+- Database: `C:\Users\matt6\projects\inside-trader-detector\data\gamma_verified_v2.sqlite3`
+- Cohort: `balanced-tags-v2`
+- Scheduled task: `InformedFlow-gamma-v2`
+- Log: `C:\Users\matt6\projects\inside-trader-detector\data\gamma_verified_v2.log`
+- Intended interpreter: `C:\Users\matt6\projects\inside-trader-detector\.venv311\Scripts\python.exe`
+
+Do not delete or replace this database. `balanced-tags-v2` is the first cohort that
+uses the required `gamma_markets_v1` gate. The old `balanced-tags-v1` and earlier
+test databases are audit/history only and are not training inputs.
+
+The collection command used for this dataset was:
+
+```powershell
+.\.venv311\Scripts\python.exe -m informed_flow `
+  --db "data\gamma_verified_v2.sqlite3" `
+  run `
+  --cohort balanced-tags-v2 `
+  --markets-per-category 1000 `
+  --admission-rate 0.50 `
+  --seed 0 `
+  --similarity-threshold 0.90 `
+  --market-workers 2 `
+  --enrichment-workers 2 `
+  --resolution-workers 2 `
+  --label-workers 2 `
+  --embedding-device auto
+```
+
+Discovery can be stopped permanently while completing the frozen selection with:
+
+```powershell
+Stop-ScheduledTask -TaskName "InformedFlow-gamma-v2"
+
+.\.venv311\Scripts\python.exe -m informed_flow `
+  --db "data\gamma_verified_v2.sqlite3" `
+  finish-existing `
+  --cohort balanced-tags-v2 `
+  --market-workers 2 `
+  --enrichment-workers 1 `
+  --resolution-workers 1 `
+  --label-workers 2
+```
+
+`finish-existing` is idempotent but permanently freezes the cohort. It discovers no
+new markets and does not reclassify the selection. It resumes remaining selected-
+market trade scans, builds/reconciles enrichment and label jobs, and exits when the
+queue has completed or dead-lettered all relevant work. It runs market scans,
+enrichment, and labels concurrently; the defaults are two workers for each group.
+Resolution workers are effectively idle because the command refuses to start unless
+every selected market already has terminal `gamma_markets_v1` evidence. One
+enrichment worker is the conservative Windows setting because two trades can request
+the same uncached wallet/window concurrently; that race wastes a duplicate fetch even
+though the unique job lease prevents the same job from being claimed twice.
+When launched directly from an SSH PowerShell session, the process is tied to that
+session. For unattended completion, replace the pipeline command in
+`run_gamma_v2.cmd` with the `finish-existing` invocation above and then start the
+existing scheduled task; Task Scheduler will continue after SSH disconnects.
+
+Useful operating commands are:
+
+```powershell
+# Report
+.\.venv311\Scripts\python.exe -m informed_flow `
+  --db "data\gamma_verified_v2.sqlite3" `
+  report --cohort balanced-tags-v2
+
+# Follow the log; Ctrl+C stops only the viewer
+Get-Content "data\gamma_verified_v2.log" -Tail 50 -Wait
+
+# Scheduled-task state and last exit code
+Get-ScheduledTask -TaskName "InformedFlow-gamma-v2" |
+  Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName "InformedFlow-gamma-v2" |
+  Select-Object LastRunTime, LastTaskResult
+
+# Start or stop the scheduled process
+Start-ScheduledTask -TaskName "InformedFlow-gamma-v2"
+Stop-ScheduledTask -TaskName "InformedFlow-gamma-v2"
+
+# Main database plus SQLite WAL/SHM disk usage
+Get-ChildItem "data\gamma_verified_v2.sqlite3*" |
+  Select-Object Name,@{Name="SizeMB";Expression={[math]::Round($_.Length / 1MB,2)}}
+
+# Portable training exports after finish-existing completes
+.\.venv311\Scripts\python.exe -m informed_flow `
+  --db "data\gamma_verified_v2.sqlite3" `
+  export --cohort balanced-tags-v2 --output "data\gamma_verified_v2_export"
+```
+
+The scheduled launcher `run_gamma_v2.cmd` must invoke the `.venv311` interpreter
+above. Do not restore the failing Python 3.12 executable. For GPU discovery, the
+launcher must not contain `set CUDA_VISIBLE_DEVICES=-1`. GPU acceleration affects
+semantic selection during discovery; `finish-existing` is mainly API and SQLite
+work. The environment check used before restarting was:
+
+```powershell
+.\.venv311\Scripts\python.exe -X faulthandler -c "import argparse, sqlite3, torch, sentence_transformers; print('Environment OK'); print('PyTorch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+```
+
+Python 3.12 previously crashed during `import argparse` with Windows status
+`0xC0000005`, before pipeline code ran. Python 3.11 passed its standard-library
+startup but Windows Smart App Control initially blocked PyTorch's unsigned
+`torch\lib\shm.dll` with WinError 4551 and Code Integrity event 3077. Treat those
+as machine/runtime issues, not SQLite or duplicate-job failures. If the machine
+really has intermittent RAM errors, do not trust long database-writing runs until
+Windows Memory Diagnostic passes.
+
+### Current data snapshot (2026-10-08, not final)
+
+The database was approximately 315.06 MB when the following report excerpt was
+recorded. These counts may grow until `finish-existing` completes:
+
+| Category | Eligible | Selected | Selected with trades | Qualifying trades | Zero-trade selected | Shortfall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| sports | 4,136 | 239 | 95 | 1,924 | 144 | 761 |
+| crypto | 11 | 4 | 2 | 16 | 2 | 996 |
+| weather | 0 | 0 | 0 | 0 | 0 | 1,000 |
+| culture | 912 | 73 | 50 | 225 | 23 | 927 |
+| finance | 1,488 | 175 | 150 | 5,255 | 25 | 825 |
+| geopolitics | 1,100 | 169 | 159 | 5,918 | 10 | 831 |
+| politics | 655 | 104 | 94 | 7,069 | 10 | 896 |
+
+The planned first training scope is sports, finance, geopolitics, and politics:
+687 selected markets, 498 markets with at least one qualifying trade, and 20,166
+trade rows in this snapshot. The trade count is not the independent sample size;
+trades are clustered within markets, events, and wallets. Do not delete the other
+categories; filter them at training time. Capture a new report and replace these
+snapshot counts after finalization.
 
 ## Checkout and database locations
 
-The user runs VS Code from `C:\Users\matt6\projects\inside-trader-detector`.
-This chat's workspace is
-`C:\Users\matt6\.codex\worktrees\d527\inside-trader-detector`.
-The latest summary-only changes were applied in both locations; do not assume
-edits in one automatically update the other. Check the active checkout and Git
-status before edits/commits and explain where changes live. Do not claim changes
-are committed, merged, or pushed unless those actions were verified.
+The collection runtime and authoritative active database are on Windows at the
+paths in the Phase 1 handoff above. This documentation was updated from the Mac
+checkout `/Users/matthewhu/Projects/inside-trader-detector`; edits there do not
+automatically change the Windows checkout. Check the active checkout and Git status
+before edits or commits, and sync changes deliberately. Do not claim changes are
+committed, merged, pushed, or present on Windows unless verified.
 
-The collected test database remains at
+An older collected test database may remain at
 `C:\Users\matt6\.codex\worktrees\d527\inside-trader-detector\data\test_90d_v2.sqlite3`.
-Use that absolute `--db` path when running from the original checkout. A relative
-database path there points to a different database. Never delete raw research
-trades during enrichment-history cleanup.
+It is not the active Phase 2 source. Never delete raw research trades during
+enrichment-history cleanup.
 
 ## Next steps
 
-1. Finish/resume historical collection and enrich the selected trades using the
-   summary-only implementation. Inspect coverage, missing fields, errors, storage
-   growth, score distributions, and category imbalance. A trade's enrichment
-   status of `complete` means processing succeeded; history may remain partial.
-2. Improve status reporting so users can distinguish API-returned rows, rows
-   outside the window, and saved trades, and inspect backfill completion directly
-   rather than treating an ingestion count as proof of completion.
-3. Run and inspect the resolved historical pipeline: resolution exclusions, queue
-   health, missing horizons, price-source quality, unknown fees, and gross P&L.
-   Verify any fee schedule against a source applicable at the historical trade time
-   before calculating net P&L.
-4. Evaluate outcomes/profit by heuristic score and category, comparing with market
-   price as the baseline. Account for category coverage, concentration in a few
-   wallets/events, and longshot outliers before claiming an edge.
-5. Only after reliable labels exist, train a simple supervised model from features
-   and observed outcomes/profit. Train on older periods and evaluate on newer
-   periods. Compare against the heuristic and market-price baselines; keep any
-   later paper-action rule separate from model predictions.
+1. Run `finish-existing` for `balanced-tags-v2`, then save the final report and
+   export. Inspect queue health, missing horizons, price-source quality, incomplete
+   wallet windows, category balance, and concentration. A trade's enrichment status
+   of `complete` means processing succeeded; its history can still be truncated.
+2. Follow [`docs/PHASE_2_TRAINING.md`](docs/PHASE_2_TRAINING.md) to build the
+   leakage-safe dataset audit and baseline evaluation. Do not treat the 20,166
+   target-category trade rows as 20,166 independent examples.
+3. Compare a simple supervised baseline against delayed market price and the
+   existing heuristic. Train on older periods and test on newer markets/events.
+   Report calibration and gross P&L by category; net P&L remains unknown until a
+   historically applicable fee source is verified.
+4. Improve status/reporting or collection only when the final audit identifies a
+   concrete gap. Use a new cohort name if more discovery is needed because
+   `balanced-tags-v2` is permanently frozen by `finish-existing`.
 
 Do not start these larger new phases without user authorization. Keep execution,
 wallet linking, and reinforcement learning outside the current scope.

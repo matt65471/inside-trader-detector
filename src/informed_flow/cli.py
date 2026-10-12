@@ -18,6 +18,7 @@ from .wallet_summary import compact_wallet_history
 from .sampled_backfill import SampledBackfill, SampledBackfillConfig, TARGET_CATEGORIES
 from .jobs import JobQueue
 from .pipeline import AutomatedPipeline
+from .training_audit import DEFAULT_MODEL_CATEGORIES, audit_database, write_audit
 
 DEFAULT_DB = Path("data/informed_flow.sqlite3")
 
@@ -554,6 +555,15 @@ def build_parser() -> argparse.ArgumentParser:
     export = subparsers.add_parser("export", help="Export portable CSV datasets")
     export.add_argument("--output", type=Path, default=Path("exports"))
     export.add_argument("--cohort")
+    audit = subparsers.add_parser(
+        "audit", help="Run the read-only Phase 2 training-data audit"
+    )
+    audit.add_argument("--cohort", required=True)
+    audit.add_argument("--output", type=Path, default=Path("data/audits"))
+    audit.add_argument(
+        "--categories", nargs="+", default=list(DEFAULT_MODEL_CATEGORIES),
+        help="Modeling categories (default: sports finance geopolitics politics)",
+    )
     retry = subparsers.add_parser("retry-jobs", help="Return dead queue jobs to pending")
     retry.add_argument("--kind")
     retry.add_argument("--entity-id")
@@ -580,6 +590,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     for field in ("market_workers", "enrichment_workers", "resolution_workers", "label_workers"):
         if getattr(args, field, 1) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
+
+    if args.command == "audit":
+        try:
+            report = audit_database(args.db, args.cohort, categories=tuple(args.categories))
+            json_path, markdown_path = write_audit(report, args.output)
+            print(f"Phase 2 audit {'passed' if report['passed'] else 'failed'}")
+            print(f"  JSON: {json_path}")
+            print(f"  Markdown: {markdown_path}")
+            for item in report["checks"]:
+                if not item["passed"]:
+                    print(f"  FAIL {item['name']}: {item['detail']}")
+            return 0 if report["passed"] else 1
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
 
     db = Database(args.db)
     try:
