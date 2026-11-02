@@ -30,12 +30,6 @@ An individual-scale system that:
   arbitrage scanner (`polyarb`) was built anyway. Do not expand it unless asked.
 - The user wants implementation details and, when they say so, code for the
   informed-flow detector. Confirm before large new builds.
-- The local checkout is `/Users/matthewhu/Projects/inside-trader-detector`.
-  Cloud agents cannot see that path. Work in this repo and push; they pull.
-- The prior private remote was
-  `https://cursor.com/codebase/matthew-hu-dev/inside-trader-detector`. The prior
-  environment had Origin credentials but not GitHub credentials, so the user
-  needed to push to GitHub themselves.
 - Pure arbitrage is not the path. A scan of roughly 400 neg-risk events found
   one fully covered basket: about $1.39 profit on $329 locked for about 29 days
   (roughly 5% annualized). Large apparent arbitrages were usually false because
