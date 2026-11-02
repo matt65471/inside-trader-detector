@@ -6,10 +6,12 @@ import json
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from .api import PolymarketAPI
+from .dataset import DEFAULT_CATEGORIES, DatasetConfig, build_dataset
 from .db import Database
 from .service import Collector, Counts
 from .api import APIError
@@ -554,10 +556,52 @@ def build_parser() -> argparse.ArgumentParser:
     export = subparsers.add_parser("export", help="Export portable CSV datasets")
     export.add_argument("--output", type=Path, default=Path("exports"))
     export.add_argument("--cohort")
+    dataset = subparsers.add_parser(
+        "build-dataset",
+        help="Write a read-only, time-split training dataset (features and sealed labels)",
+    )
+    dataset.add_argument("--cohort", required=True)
+    dataset.add_argument("--output", type=Path, required=True)
+    dataset.add_argument(
+        "--categories", default=",".join(DEFAULT_CATEGORIES),
+        help="Comma-separated canonical categories",
+    )
+    dataset.add_argument(
+        "--test-start", default="2026-08-15",
+        help="UTC date (YYYY-MM-DD); markets first traded on/after it are test",
+    )
+    dataset.add_argument("--seed", type=int, default=0)
     retry = subparsers.add_parser("retry-jobs", help="Return dead queue jobs to pending")
     retry.add_argument("--kind")
     retry.add_argument("--entity-id")
     return parser
+
+
+def _build_dataset(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    categories = tuple(part.strip() for part in args.categories.split(",") if part.strip())
+    unknown = sorted(set(categories) - set(TARGET_CATEGORIES))
+    if not categories or unknown:
+        parser.error(f"--categories must be from {', '.join(TARGET_CATEGORIES)}")
+    try:
+        cutoff = datetime.strptime(args.test_start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        parser.error("--test-start must be a date like 2026-08-15")
+    config = DatasetConfig(
+        db_path=Path(args.db), cohort=args.cohort, output=args.output,
+        test_start=int(cutoff.timestamp()), categories=categories, seed=args.seed,
+    )
+    try:
+        manifest = build_dataset(config)
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    rows = manifest["rows"]
+    print(
+        f"Wrote {rows['total']} trades to {args.output} "
+        f"(train={rows['train']}, test={rows['test']}). "
+        "labels_test.csv is sealed until the final evaluation; see report.md."
+    )
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -580,6 +624,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for field in ("market_workers", "enrichment_workers", "resolution_workers", "label_workers"):
         if getattr(args, field, 1) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
+
+    if args.command == "build-dataset":
+        return _build_dataset(parser, args)
 
     db = Database(args.db)
     try:

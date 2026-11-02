@@ -124,9 +124,25 @@ section for the current status, while retaining that document's research scope.
 - Phase 2 historical labeling and gross-profit calculation are implemented. Model
   training, profitability claims, and paper trading are **not implemented**. Do not
   train a model to reproduce the heuristic score.
+- `build-dataset` (`src/informed_flow/dataset.py`, added 2026-11-01) writes a
+  training dataset without modifying the database (it opens SQLite read-only and runs
+  before `Database.initialize`). Defaults: categories sports, finance, geopolitics,
+  politics, culture; test cutoff 2026-08-15; seed 0. Only enriched trades in selected,
+  Gamma-resolved cohort markets are included. Splits are by market (one selected market
+  per event): first trade on/after the cutoff -> test; resolved before it -> train;
+  markets that span it are assigned whole by a seeded 50/50 coin flip
+  (`split_basis=overlap_random`). **User decision: do not purge/discard overlap rows;**
+  flag them instead and report test results with and without them. Train markets get
+  seeded 5-fold `cv_fold` values. Labels are in separate files; `labels_test.csv` is
+  sealed, and the report/manifest never summarise test outcomes. Post-close market
+  snapshots, resolution fields, order books, and always-unknown wallet-age fields are
+  excluded from features. `sample_weight` is 4 for sampled trades under $500, and
+  `market_weight` is 1/trades in the market. Output folders are never overwritten.
+  The first build is `data/datasets/five-cat-v1` (9,945 trades: train 6,525, test 3,420).
+  Its train split is thin for sports (5 markets) and culture (2 markets).
 - The summary-only, tag-filtered streaming sampled-backfill, queue, Gamma resolution,
-  and labeling implementation was verified with 80 local tests. Update the validation record
-  when subsequent code changes introduce new checks.
+  labeling, and dataset-build implementation was verified with 89 local tests. Update the
+  validation record when subsequent code changes introduce new checks.
 
 ## Checkout and database locations
 

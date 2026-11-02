@@ -54,6 +54,7 @@ python -m informed_flow enrich
 python -m informed_flow rescore
 python -m informed_flow report
 python -m informed_flow export --output exports
+python -m informed_flow build-dataset --cohort balanced-tags-v2 --output data/datasets/five-cat-v1
 python -m informed_flow retry-jobs
 ```
 
@@ -327,6 +328,31 @@ The version 2 heuristic score adds points for a young wallet, little prior activ
 or anomalous size, a cheap outcome, near resolution, a higher-prior category,
 and clusters of young wallets. Every component is retained as JSON. The score is
 a research hypothesis, not a trading recommendation.
+
+## Training dataset
+
+`build-dataset` opens the database read-only and writes a new folder (it refuses to
+overwrite one):
+
+- `features.csv`: one row per enriched trade, with no outcomes. It contains trade,
+  time, 30-day wallet-summary, and backward-looking market-activity features, plus
+  `missing_*` flags, `burst_id`/`burst_size`, `market_weight`, `sample_weight`, and
+  the heuristic score as a baseline column.
+- `labels_train.csv` and `labels_test.csv`: `outcome_won`, `edge`, and per-horizon
+  entry price, gross per-share P&L, status, and price source. Keep the test file
+  sealed until the final evaluation.
+- `manifest.json` (settings, counts, file hashes, excluded fields) and `report.md`.
+
+Options: `--categories` (default sports, finance, geopolitics, politics, culture),
+`--test-start YYYY-MM-DD` (UTC; default 2026-08-15), and `--seed`. Splits are by
+market:
+- first trade on or after the cutoff: test
+- resolved before the cutoff: train
+- spanning the cutoff: assigned whole by a seeded 50/50 coin flip
+  (`split_basis=overlap_random`)
+
+Train markets also get a seeded 5-fold `cv_fold`. Fields that reveal the outcome,
+such as post-close market snapshots and resolutions, are excluded.
 
 ## Tests
 
