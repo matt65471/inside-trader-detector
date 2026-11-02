@@ -10,3 +10,4 @@ exports/
 YOUR_DATABASE.sqlite3
 .venv*/
 *.egg-info/
+.DS_Store
