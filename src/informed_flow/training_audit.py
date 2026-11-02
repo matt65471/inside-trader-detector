@@ -10,7 +10,7 @@ from typing import Any, Iterable
 
 from .labeling import GAMMA_RESOLUTION_SOURCE, HORIZONS
 
-AUDIT_VERSION = 1
+AUDIT_VERSION = 2
 DEFAULT_MODEL_CATEGORIES = ("sports", "finance", "geopolitics", "politics")
 
 
@@ -144,7 +144,21 @@ def audit_database(
         queue = _rows(connection, """SELECT status,job_kind,COUNT(*) count
             FROM jobs WHERE cohort_name IN (?,?)
             GROUP BY status,job_kind ORDER BY status,job_kind""", (cohort, f"{cohort}:live"))
+        # A frozen cohort never processes resolution checks for markets it did not select,
+        # so those leftover jobs cannot affect the modeling population. Report them
+        # separately instead of treating them as unfinished work.
+        abandoned_candidate_jobs = _rows(connection, """SELECT j.job_key,j.job_kind,j.entity_id,
+                   j.status,j.attempts,j.last_error,cm.canonical_category,cm.selection_status
+            FROM jobs j
+            JOIN backfill_cohorts c ON c.cohort_name=j.cohort_name
+            JOIN backfill_cohort_markets cm
+              ON cm.cohort_name=j.cohort_name AND cm.condition_id=j.entity_id
+            WHERE j.cohort_name=? AND j.status IN ('pending','leased')
+              AND j.job_kind='verify_resolution' AND c.discovery_complete=1
+              AND cm.selection_status<>'selected'
+            ORDER BY cm.canonical_category,j.entity_id""", (cohort,))
         open_jobs = sum(row["count"] for row in queue if row["status"] in ("pending", "leased"))
+        relevant_open_jobs = open_jobs - len(abandoned_candidate_jobs)
         dead_jobs = sum(row["count"] for row in queue if row["status"] == "dead")
         audited_skips = _rows(connection, """SELECT job_kind,COUNT(*) count
             FROM jobs WHERE cohort_name IN (?,?) AND status='succeeded'
@@ -157,7 +171,12 @@ def audit_database(
             FROM jobs WHERE cohort_name IN (?,?) AND status='succeeded'
               AND last_error LIKE 'skipped%'
             ORDER BY updated_at DESC,job_id DESC""", (cohort, f"{cohort}:live"))
-        check("queue_drained", open_jobs == 0, f"pending_or_leased={open_jobs}")
+        check("queue_drained", relevant_open_jobs == 0,
+              f"pending_or_leased={relevant_open_jobs} "
+              f"(excluding {len(abandoned_candidate_jobs)} abandoned candidate jobs)")
+        check("abandoned_candidate_jobs", not abandoned_candidate_jobs,
+              f"unselected_candidate_verify_resolution_jobs={len(abandoned_candidate_jobs)}",
+              severity="warning")
         check("no_dead_jobs", dead_jobs == 0, f"dead={dead_jobs}")
 
         scope_params = (cohort, *categories)
@@ -316,6 +335,8 @@ def audit_database(
             "queue": {
                 "by_status_and_kind": queue,
                 "open_jobs": open_jobs,
+                "relevant_open_jobs": relevant_open_jobs,
+                "abandoned_candidate_jobs": abandoned_candidate_jobs,
                 "dead_jobs": dead_jobs,
                 "audited_skips": audited_skips,
                 "dead_job_details": dead_job_details,
@@ -363,7 +384,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "| --- | --- | --- |",
     ]
     for item in report["checks"]:
-        result = "PASS" if item["passed"] else "FAIL"
+        result = "PASS" if item["passed"] else ("FAIL" if item["severity"] == "error" else "WARN")
         detail = str(item["detail"]).replace("|", "\\|")
         lines.append(f"| {result} | `{item['name']}` | {detail} |")
     lines.extend(["", "## Label coverage", "",
@@ -388,6 +409,17 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"| {item['canonical_category']} | {item['trades']} | {item['wallets']} | "
             f"{item['markets']} | {item['events']} | {item['mean_trade_price']} |"
         )
+    abandoned = report["queue"]["abandoned_candidate_jobs"]
+    if abandoned:
+        lines.extend(["", "## Abandoned candidate jobs", "",
+                      f"{len(abandoned)} `verify_resolution` jobs remain pending for markets the frozen "
+                      "cohort never selected. They have no trades in the modeling population and do "
+                      "not block the audit.", "",
+                      "| Category | Selection status | Condition ID |",
+                      "| --- | --- | --- |"])
+        for item in abandoned:
+            lines.append(f"| {item['canonical_category']} | {item['selection_status']} | "
+                         f"`{item['entity_id']}` |")
     concentration = report["concentration"]
     lines.extend(["", "## Concentration", "",
                   f"Largest market share of trades: {concentration['largest_market_trade_share_percent']}%  ",

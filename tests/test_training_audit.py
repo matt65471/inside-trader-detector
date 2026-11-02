@@ -106,5 +106,53 @@ class TrainingAuditTests(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+    def _add_candidate_with_pending_job(self, selection_status: str) -> None:
+        with self.db.connection:
+            self.db.connection.execute(
+                """INSERT INTO backfill_cohort_markets(
+                       cohort_name,condition_id,event_id,event_slug,title,canonical_category,raw_json,
+                       eligible,random_rank,selection_status,fetch_status,qualifying_trade_count,
+                       discovered_at)
+                   VALUES ('cohort','candidate','event2','event2','Other?','politics','{}',1,'2',
+                           ?,'not_selected',0,1)""",
+                (selection_status,),
+            )
+            self.db.connection.execute(
+                """INSERT INTO jobs(job_key,job_kind,cohort_name,entity_id,payload_json,status,
+                       available_at,attempts,max_attempts,created_at,updated_at)
+                   VALUES ('verify_resolution:cohort:candidate','verify_resolution','cohort',
+                           'candidate','{}','pending',1,0,8,1,1)"""
+            )
+
+    def test_abandoned_candidate_job_warns_but_passes(self) -> None:
+        self._add_candidate_with_pending_job("candidate")
+        report = audit_database(self.path, "cohort", generated_at=123)
+        self.assertTrue(report["passed"])
+        checks = {item["name"]: item for item in report["checks"]}
+        self.assertTrue(checks["queue_drained"]["passed"])
+        self.assertFalse(checks["abandoned_candidate_jobs"]["passed"])
+        self.assertEqual(checks["abandoned_candidate_jobs"]["severity"], "warning")
+        self.assertEqual(len(report["queue"]["abandoned_candidate_jobs"]), 1)
+        markdown = render_markdown(report)
+        self.assertIn("Overall status: PASS", markdown)
+        self.assertIn("| WARN | `abandoned_candidate_jobs`", markdown)
+        self.assertIn("`candidate`", markdown)
+
+    def test_pending_job_for_selected_market_still_fails(self) -> None:
+        self._add_candidate_with_pending_job("selected")
+        report = audit_database(self.path, "cohort", generated_at=123)
+        self.assertFalse(report["passed"])
+        failed = {item["name"] for item in report["checks"] if not item["passed"]}
+        self.assertIn("queue_drained", failed)
+
+    def test_candidate_job_blocks_when_discovery_not_frozen(self) -> None:
+        self._add_candidate_with_pending_job("candidate")
+        with self.db.connection:
+            self.db.connection.execute("UPDATE backfill_cohorts SET discovery_complete=0")
+        report = audit_database(self.path, "cohort", generated_at=123)
+        checks = {item["name"]: item for item in report["checks"]}
+        self.assertFalse(checks["queue_drained"]["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

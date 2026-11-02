@@ -646,7 +646,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  Markdown: {markdown_path}")
             for item in report["checks"]:
                 if not item["passed"]:
-                    print(f"  FAIL {item['name']}: {item['detail']}")
+                    label = "FAIL" if item["severity"] == "error" else "WARN"
+                    print(f"  {label} {item['name']}: {item['detail']}")
             return 0 if report["passed"] else 1
         except ValueError as exc:
             print(exc, file=sys.stderr)

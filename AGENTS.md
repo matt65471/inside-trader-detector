@@ -144,9 +144,16 @@ section for the current status, while retaining that document's research scope.
   `market_weight` is 1/trades in the market. Output folders are never overwritten.
   The first build is `data/datasets/five-cat-v1` (9,945 trades: train 6,525, test 3,420).
   Its train split is thin for sports (5 markets) and culture (2 markets).
+- 2026-11-02: the Phase 2 audit (sports, finance, geopolitics, politics) PASSED on
+  `data/gamma_verified_v2_training_backup.sqlite3` (SQLite backup of the frozen database).
+  Audit v2 reports pending `verify_resolution` jobs for never-selected candidates in a
+  frozen cohort as a non-blocking `abandoned_candidate_jobs` warning (32 here); all other
+  pending/leased jobs still fail `queue_drained`. Culture is excluded from modeling; the
+  four-category dataset is `data/datasets/four-cat-v1` (9,862 trades: train 6,516 from
+  150 markets, test 3,346), built from the backup.
 - The summary-only, tag-filtered streaming sampled-backfill, queue, Gamma resolution,
   labeling, dataset-build, and read-only Phase 2 audit implementation was verified
-  with 91 local tests. Update the validation record when subsequent code
+  with 94 local tests. Update the validation record when subsequent code
   changes introduce new checks.
 
 ## Phase 1 operational handoff
