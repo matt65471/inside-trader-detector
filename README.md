@@ -55,6 +55,7 @@ python -m informed_flow rescore
 python -m informed_flow report
 python -m informed_flow export --output exports
 python -m informed_flow build-dataset --cohort balanced-tags-v2 --output data/datasets/five-cat-v1
+python -m informed_flow train-baseline --dataset data/datasets/four-cat-v1 --output data/models/four-cat-v1-logreg-v1
 python -m informed_flow retry-jobs
 ```
 
@@ -353,6 +354,35 @@ market:
 
 Train markets also get a seeded 5-fold `cv_fold`. Fields that reveal the outcome,
 such as post-close market snapshots and resolutions, are excluded.
+
+## Logistic-regression baseline
+
+`train-baseline` needs the model extras (`pip install -e .[model]`: numpy and
+scikit-learn). It reads only the training split of a `build-dataset` folder and never
+opens `labels_test.csv`.
+
+It predicts the probability that the purchased outcome wins, with `logit(price)` as a
+feature so the market's odds are the starting point. A cross-validated grid over the
+dataset's market-level `cv_fold` covers:
+
+- feature sets: `price_only` (baseline), `price_category`, `full` (wallet, size, timing,
+  burst features plus missing flags), and `full_interactions` (full x `logit(price)`)
+- penalty: L2 or elastic net (`--l1-ratios`, default `0,0.5`) and `C` (`--c-grid`)
+- row weighting: `none`, `sample`, `market`, `sample_x_market`
+- trade filter: `all` and `price_lt_0.95`, reported as separate experiments
+
+Every candidate is scored with the same weights (`sample_weight x market_weight`, so each
+market counts about once). The simplest candidate within one standard error of the best
+mean fold log loss is chosen, then refit on all training rows. Identifiers, the heuristic
+score, outcome text, and calendar/time-trend columns are not inputs.
+
+The output folder (never overwritten) holds `report.md`, `manifest.json`,
+`cv_results.csv` (every candidate and fold), `oof_predictions.csv`, and per-filter
+`model_*.json` and `coefficients_*.csv`. The report compares against constant, raw trade
+price, price-only, and price-plus-heuristic baselines, and includes category breakdowns,
+calibration, and a +15 minute follow diagnostic with market-clustered bootstrap
+intervals. These are in-training out-of-fold diagnostics, not test results or
+profitability claims.
 
 ## Tests
 

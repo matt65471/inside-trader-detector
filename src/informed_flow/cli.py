@@ -581,6 +581,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--categories", nargs="+", default=list(DEFAULT_MODEL_CATEGORIES),
         help="Modeling categories (default: sports finance geopolitics politics)",
     )
+    baseline = subparsers.add_parser(
+        "train-baseline",
+        help="Cross-validate a logistic-regression baseline on a dataset's training split",
+    )
+    baseline.add_argument("--dataset", type=Path, required=True,
+                          help="Folder written by build-dataset")
+    baseline.add_argument("--output", type=Path, required=True,
+                          help="New folder for CV results and the chosen model")
+    baseline.add_argument("--horizon", choices=("15m", "1h", "24h"), default="15m",
+                          help="Delayed entry horizon for the follow diagnostic")
+    baseline.add_argument("--seed", type=int, default=0)
+    baseline.add_argument("--jobs", type=int, default=-1,
+                          help="Parallel CPU workers for the CV grid (-1 = all cores)")
+    baseline.add_argument("--c-grid", help="Comma-separated C values")
+    baseline.add_argument("--l1-ratios", help="Comma-separated l1_ratio values (0 = L2)")
+    baseline.add_argument("--weightings", help="Comma-separated: none,sample,market,sample_x_market")
+    baseline.add_argument("--filters", help="Comma-separated: all,price_lt_0.95")
+    baseline.add_argument("--feature-sets",
+                          help="Comma-separated: price_only,price_category,full,full_interactions")
     retry = subparsers.add_parser("retry-jobs", help="Return dead queue jobs to pending")
     retry.add_argument("--kind")
     retry.add_argument("--entity-id")
@@ -614,6 +633,48 @@ def _build_dataset(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     return 0
 
 
+def _train_baseline(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    try:
+        from .baseline_model import (
+            DEFAULT_C_GRID, DEFAULT_L1_RATIOS, FEATURE_SETS, FILTERS, WEIGHTINGS,
+            TrainConfig, parse_float_list, parse_name_list, train_baseline,
+        )
+    except ImportError as exc:  # pragma: no cover - depends on optional install
+        print(f"train-baseline needs the model extras (pip install -e .[model]): {exc}",
+              file=sys.stderr)
+        return 1
+    try:
+        feature_sets = (parse_name_list(args.feature_sets, FEATURE_SETS)
+                        if args.feature_sets else FEATURE_SETS)
+        if "price_only" not in feature_sets:
+            feature_sets = ("price_only", *feature_sets)
+        config = TrainConfig(
+            dataset=args.dataset, output=args.output, horizon=args.horizon, seed=args.seed,
+            c_grid=parse_float_list(args.c_grid) if args.c_grid else DEFAULT_C_GRID,
+            l1_ratios=parse_float_list(args.l1_ratios) if args.l1_ratios else DEFAULT_L1_RATIOS,
+            weightings=(parse_name_list(args.weightings, WEIGHTINGS)
+                        if args.weightings else WEIGHTINGS),
+            filters=parse_name_list(args.filters, FILTERS) if args.filters else tuple(FILTERS),
+            feature_sets=feature_sets, jobs=args.jobs,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if any(c <= 0 for c in config.c_grid) or any(not 0 <= r <= 1 for r in config.l1_ratios):
+        parser.error("--c-grid values must be positive and --l1-ratios within [0, 1]")
+    try:
+        manifest = train_baseline(config, progress=lambda message: print(message, flush=True))
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    for name, experiment in manifest["experiments"].items():
+        scores = experiment["chosen_scores"]
+        print(f"[{name}] chosen {experiment['chosen']}: log loss {scores['mean_log_loss']:.4f}, "
+              f"vs price-only {scores['delta_vs_price_only']:+.4f} "
+              f"(+/- {scores['delta_se']:.4f})")
+    print(f"Wrote {args.output}; see report.md and train.log. labels_test.csv was not opened.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -637,6 +698,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "build-dataset":
         return _build_dataset(parser, args)
+    if args.command == "train-baseline":
+        return _train_baseline(parser, args)
     if args.command == "audit":
         try:
             report = audit_database(args.db, args.cohort, categories=tuple(args.categories))
